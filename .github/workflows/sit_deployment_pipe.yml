@@ -1,4 +1,4 @@
-name: Deployment Across Environments
+name: Manual Environment Deployment
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
         description: 'sit-release'
         required: true
       target_files:
-        description: 'Comma-separated list of scripts/files to migrate (leave empty to migrate all except exclusions)'
+        description: 'Comma-separated list of scripts/files to migrate (leave empty for all except exclusions)'
         required: false
 
 jobs:
@@ -73,7 +73,7 @@ jobs:
           destination_branch: ${{ github.event.inputs.destination_branch }}
           title: "Deployment: ${{ github.event.inputs.source_branch }} → ${{ github.event.inputs.destination_branch }}"
           body: |
-            Automated deployment.
+            Manual deployment.
             - Source branch: ${{ github.event.inputs.source_branch }}
             - Destination branch: ${{ github.event.inputs.destination_branch }}
             - Migrated files: ${{ github.event.inputs.target_files || 'All except exclusions' }}

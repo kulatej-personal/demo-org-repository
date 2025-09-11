@@ -1,4 +1,4 @@
-name: Manual Environment Deployment
+name: Manual Pull Request Deployment
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ on:
         required: false
 
 jobs:
-  deploy:
+  create-pr:
     runs-on: ubuntu-latest
 
     steps:
@@ -83,3 +83,6 @@ jobs:
             - Destination branch: ${{ github.event.inputs.destination_branch }}
             - Migrated files: ${{ github.event.inputs.target_files || 'All except exclusions' }}
             - Exclusions preserved from destination: source.yml, relx_fivetran_connector_mapping
+
+# Note: This workflow ONLY creates the PR. 
+# Merging must be done manually by a user/reviewer after approval in the GitHub UI.

@@ -1,0 +1,86 @@
+name: Deploy Scripts with PR & Approval
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: 'Source branch for deployment'
+        required: true
+        type: string
+      destination_branch:
+        description: 'Destination branch to deploy into'
+        required: true
+        type: string
+      files:
+        description: 'Comma-separated list of files to deploy (optional)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  DEFAULT_FILES: |
+    source.yml
+    "relx fivetran mapping seed file"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout destination branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.destination_branch }}
+
+      - name: Save default files from destination branch
+        run: |
+          mkdir -p default-files
+          for file in $DEFAULT_FILES; do
+            if [ -f "$file" ]; then
+              cp "$file" "default-files/"
+            fi
+          done
+
+      - name: Checkout source branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.source_branch }}
+
+      - name: Copy specified files to deploy
+        if: ${{ github.event.inputs.files != '' }}
+        run: |
+          mkdir -p ../deploy-temp
+          IFS=',' read -ra file_array <<< "${{ github.event.inputs.files }}"
+          for f in "${file_array[@]}"; do
+            echo "Copying file $f"
+            cp -r "$f" ../deploy-temp/ || echo "File $f does not exist in source branch"
+          done
+          cp -r ../deploy-temp/* .
+
+      - name: Restore default files from destination
+        run: |
+          cp -r ../default-files/* .
+
+      - name: Create temporary deployment branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b deploy-pr-${{ github.run_id }}
+          git add .
+          git commit -m "Deploy scripts from ${{ github.event.inputs.source_branch }} to ${{ github.event.inputs.destination_branch }}"
+          git push --set-upstream origin deploy-pr-${{ github.run_id }}
+
+      - name: Create Pull Request
+        id: create_pr
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: Deploy scripts from ${{ github.event.inputs.source_branch }} to ${{ github.event.inputs.destination_branch }}
+          branch: deploy-pr-${{ github.run_id }}
+          base: ${{ github.event.inputs.destination_branch }}
+          title: "Deploy: merge from ${{ github.event.inputs.source_branch }} to ${{ github.event.inputs.destination_branch }}"
+          body: |
+            This PR was created automatically by a deployment workflow.
+            Please review and approve to merge the deployment.

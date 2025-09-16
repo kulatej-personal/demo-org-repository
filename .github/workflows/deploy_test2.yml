@@ -1,5 +1,4 @@
 name: Deploy Scripts with PR & Approval
-
 on:
   workflow_dispatch:
     inputs:
@@ -15,16 +14,13 @@ on:
         description: 'Comma-separated list of files to deploy (optional)'
         required: false
         type: string
-
 permissions:
   contents: write
   pull-requests: write
-
 env:
   DEFAULT_FILES: |
     source.yml
-    "relx fivetran mapping seed file"
-
+    relx fivetran mapping seed file
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -33,21 +29,21 @@ jobs:
         uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.destination_branch }}
-
       - name: Save default files from destination branch
         run: |
           mkdir -p default-files
-          for file in $DEFAULT_FILES; do
+          while IFS= read -r file; do
             if [ -f "$file" ]; then
-              cp "$file" "default-files/"
+              echo "Saving file $file to default-files/"
+              cp "$file" default-files/
+            else
+              echo "File $file does not exist in destination branch"
             fi
-          done
-
+          done <<< "$DEFAULT_FILES"
       - name: Checkout source branch
         uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.source_branch }}
-
       - name: Copy specified files to deploy
         if: ${{ github.event.inputs.files != '' }}
         run: |
@@ -58,11 +54,13 @@ jobs:
             cp -r "$f" ../deploy-temp/ || echo "File $f does not exist in source branch"
           done
           cp -r ../deploy-temp/* .
-
       - name: Restore default files from destination
         run: |
-          cp -r ../default-files/* .
-
+          if ls ../default-files/* >/dev/null 2>&1; then
+            cp -r ../default-files/* .
+          else
+            echo "No default files to restore from ../default-files"
+          fi
       - name: Create temporary deployment branch
         run: |
           git config user.name "github-actions[bot]"
@@ -71,10 +69,9 @@ jobs:
           git add .
           git commit -m "Deploy scripts from ${{ github.event.inputs.source_branch }} to ${{ github.event.inputs.destination_branch }}"
           git push --set-upstream origin deploy-pr-${{ github.run_id }}
-
       - name: Create Pull Request
         id: create_pr
-        uses: peter-evans/create-pull-request@v5
+        uses: actions/checkout@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: Deploy scripts from ${{ github.event.inputs.source_branch }} to ${{ github.event.inputs.destination_branch }}

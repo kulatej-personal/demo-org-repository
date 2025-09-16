@@ -20,7 +20,7 @@ permissions:
 env:
   DEFAULT_FILES: |
     source.yml
-    relx fivetran mapping seed file
+    relx_fivetran_connector_mapping.csv
 jobs:
   deploy:
     runs-on: ubuntu-latest

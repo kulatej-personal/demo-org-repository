@@ -179,19 +179,37 @@ jobs:
         uses: actions/github-script@v7
         env:
           GITHUB_TOKEN: ${{ inputs.github_token }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          DESTINATION_BRANCH: ${{ inputs.destination_branch }}
+          MERGER_BRANCH: ${{ steps.create_branch.outputs.merger_branch }}
+          DEPLOYER: ${{ github.actor }}
         with:
           github-token: ${{ inputs.github_token }}
           script: |
             const fs = require('fs');
 
-            const deployed = fs.readFileSync('/tmp/deployed_files.txt','utf8');
-            const failed = fs.readFileSync('/tmp/failed_files.txt','utf8');
-            const count = fs.readFileSync('/tmp/deployed_count.txt','utf8').trim();
+            const deployed = fs.existsSync('/tmp/deployed_files.txt')
+              ? fs.readFileSync('/tmp/deployed_files.txt', 'utf8')
+              : '';
+
+            const failed = fs.existsSync('/tmp/failed_files.txt')
+              ? fs.readFileSync('/tmp/failed_files.txt', 'utf8')
+              : '';
+
+            const count = fs.existsSync('/tmp/deployed_count.txt')
+              ? fs.readFileSync('/tmp/deployed_count.txt', 'utf8').trim()
+              : '0';
+
+            const src = process.env.SOURCE_BRANCH;
+            const dst = process.env.DESTINATION_BRANCH;
+            const actor = process.env.DEPLOYER;
+            const headBranch = process.env.MERGER_BRANCH;
 
             let body = `## 🚀 Deployment Request
 
-**Source:** \`${{ inputs.source_branch }}\`
-**Destination:** \`${{ inputs.destination_branch }}\`
+**Source:** \`${src}\`
+**Destination:** \`${dst}\`
+**Triggered by:** @${actor}
 **Deployed:** ${count} file(s)
 
 ### ✅ Deployed Files
@@ -212,9 +230,9 @@ ${failed}
             await github.rest.pulls.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `Deploy: ${{ inputs.source_branch }} → ${{ inputs.destination_branch }}`,
-              head: '${{ steps.create_branch.outputs.merger_branch }}',
-              base: '${{ inputs.destination_branch }}',
+              title: `Deploy: ${src} → ${dst}`,
+              head: headBranch,
+              base: dst,
               body
             });
 

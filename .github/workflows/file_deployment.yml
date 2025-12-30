@@ -1,0 +1,525 @@
+# Automated Branch Deployment with File Upload Support
+# - Accepts CSV/Excel file with deployment file list
+# - Extracts file names from "File Names" column (comma-separated values supported)
+# - Matches files by name only (ignoring extensions)
+# - Creates a temporary merger branch and PR
+
+name: file deployment test
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: 'Source branch to deploy from'
+        required: true
+        type: string
+      destination_branch:
+        description: 'Destination branch to deploy to'
+        required: true
+        type: string
+      github_token:
+        description: 'GitHub Personal Access Token (PAT) with repo and workflow permissions'
+        required: true
+        type: string
+      deployment_file_url:
+        description: 'URL to CSV/Excel file with deployment list (must be publicly accessible or raw GitHub URL)'
+        required: false
+        type: string
+      file_names:
+        description: 'OR: Comma-separated list of files to deploy (leave both empty for all changes)'
+        required: false
+        type: string
+      exclude_files:
+        description: 'Files to exclude (defaults applied)'
+        required: false
+        type: string
+        default: 'source.yml,relx_fivetran_connector_mapping.csv'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create-deployment-pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ inputs.github_token }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas openpyxl requests
+
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+      - name: Validate branches exist
+        id: validate
+        run: |
+          set -e
+          if ! git ls-remote --heads origin "${{ inputs.source_branch }}" | grep -q refs/heads; then
+            echo "Error: Source branch '${{ inputs.source_branch }}' does not exist on origin"
+            exit 1
+          fi
+          if ! git ls-remote --heads origin "${{ inputs.destination_branch }}" | grep -q refs/heads; then
+            echo "Error: Destination branch '${{ inputs.destination_branch }}' does not exist on origin"
+            exit 1
+          fi
+          echo "Branches validated successfully"
+
+      - name: Process deployment file
+        id: process_file
+        if: inputs.deployment_file_url != ''
+        run: |
+          python3 << 'EOF'
+          import pandas as pd
+          import os
+          import sys
+          import requests
+          from io import BytesIO
+
+          file_url = "${{ inputs.deployment_file_url }}"
+          
+          if not file_url:
+              print("No deployment file URL provided")
+              sys.exit(0)
+          
+          try:
+              print(f"Downloading file from: {file_url}")
+              response = requests.get(file_url, timeout=30)
+              response.raise_for_status()
+              
+              # Determine file type and read accordingly
+              if file_url.lower().endswith('.csv'):
+                  df = pd.read_csv(BytesIO(response.content))
+              elif file_url.lower().endswith(('.xlsx', '.xls')):
+                  df = pd.read_excel(BytesIO(response.content))
+              else:
+                  # Try CSV first, then Excel
+                  try:
+                      df = pd.read_csv(BytesIO(response.content))
+                  except:
+                      df = pd.read_excel(BytesIO(response.content))
+              
+              print(f"Successfully loaded file with {len(df)} rows")
+              print(f"Columns found: {list(df.columns)}")
+              
+              # Find the file names column (case-insensitive)
+              file_col = None
+              for col in df.columns:
+                  if 'file' in str(col).lower() and 'name' in str(col).lower():
+                      file_col = col
+                      break
+              
+              if file_col is None:
+                  print("Error: Could not find 'File Names' column in the file")
+                  print(f"Available columns: {list(df.columns)}")
+                  sys.exit(1)
+              
+              print(f"Using column: {file_col}")
+              
+              # Extract and process file names
+              all_files = []
+              for value in df[file_col].dropna():
+                  # Split by comma and clean up each file name
+                  files = str(value).split(',')
+                  for f in files:
+                      f = f.strip()
+                      if f:  # Skip empty strings
+                          # Remove any extensions if present
+                          base_name = f.rsplit('.', 1)[0] if '.' in f else f
+                          all_files.append(base_name)
+              
+              # Remove duplicates while preserving order
+              unique_files = list(dict.fromkeys(all_files))
+              
+              print(f"Extracted {len(unique_files)} unique file names")
+              print("Files to deploy:")
+              for f in unique_files:
+                  print(f"  - {f}")
+              
+              # Write to output file
+              with open('/tmp/deployment_files.txt', 'w') as out:
+                  out.write('\n'.join(unique_files))
+              
+              print(f"\nTotal files to deploy: {len(unique_files)}")
+              
+          except Exception as e:
+              print(f"Error processing deployment file: {str(e)}")
+              import traceback
+              traceback.print_exc()
+              sys.exit(1)
+          EOF
+
+      - name: Create merger branch (sanitized name)
+        id: create_branch
+        run: |
+          set -e
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          SRC=$(echo "${{ inputs.source_branch }}" | tr '[:upper:]' '[:lower:]' | sed 's/[\/ ]/_/g')
+          DST=$(echo "${{ inputs.destination_branch }}" | tr '[:upper:]' '[:lower:]' | sed 's/[\/ ]/_/g')
+          MERGER_BRANCH="${SRC}_to_${DST}_merger_${TIMESTAMP}"
+          echo "merger_branch=${MERGER_BRANCH}" >> "$GITHUB_OUTPUT"
+          git fetch origin "${{ inputs.destination_branch }}"
+          git checkout -b "${MERGER_BRANCH}" "origin/${{ inputs.destination_branch }}"
+          git push -u origin "${MERGER_BRANCH}"
+          echo "Created and pushed merger branch: ${MERGER_BRANCH}"
+
+      - name: Get changed files from source branch
+        id: get_changes
+        run: |
+          set -e
+          git fetch origin "${{ inputs.source_branch }}"
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACMR "origin/${{ inputs.destination_branch }}...origin/${{ inputs.source_branch }}" || true)
+          echo "$CHANGED_FILES" > /tmp/all_changed_files.txt
+          FILE_COUNT=$(echo "$CHANGED_FILES" | grep -v '^$' | wc -l || true)
+          echo "total_changes=${FILE_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "Total files changed: ${FILE_COUNT}"
+
+      - name: Match files by name (ignoring extensions)
+        id: match_files
+        run: |
+          set -e
+          
+          # Determine source of file names
+          if [ -f "/tmp/deployment_files.txt" ]; then
+            echo "Using file names from uploaded deployment file"
+            FILE_NAMES_SOURCE="/tmp/deployment_files.txt"
+          elif [ -n "${{ inputs.file_names }}" ]; then
+            echo "Using file names from manual input"
+            echo "${{ inputs.file_names }}" | tr ',' '\n' > /tmp/deployment_files.txt
+            FILE_NAMES_SOURCE="/tmp/deployment_files.txt"
+          else
+            echo "No specific files requested - will deploy all changes"
+            FILE_NAMES_SOURCE=""
+          fi
+          
+          # If we have specific file names, match them against actual files
+          if [ -n "$FILE_NAMES_SOURCE" ]; then
+            MATCHED_FILES=""
+            
+            # Get all files from source branch
+            ALL_SOURCE_FILES=$(git ls-tree -r --name-only "origin/${{ inputs.source_branch }}")
+            
+            # Read requested file names (without extensions)
+            while IFS= read -r requested_name; do
+              requested_name=$(echo "$requested_name" | xargs)
+              if [ -z "$requested_name" ]; then
+                continue
+              fi
+              
+              echo "Looking for files matching: $requested_name"
+              
+              # Search for files that match this name (ignoring extension)
+              while IFS= read -r source_file; do
+                # Get basename without extension
+                file_basename=$(basename "$source_file")
+                file_without_ext="${file_basename%.*}"
+                
+                # Match if the name matches (case-insensitive)
+                if [ "$(echo "$file_without_ext" | tr '[:upper:]' '[:lower:]')" = "$(echo "$requested_name" | tr '[:upper:]' '[:lower:]')" ]; then
+                  echo "  ✓ Matched: $source_file"
+                  MATCHED_FILES="${MATCHED_FILES}${source_file}"$'\n'
+                fi
+              done <<< "$ALL_SOURCE_FILES"
+            done < "$FILE_NAMES_SOURCE"
+            
+            echo "$MATCHED_FILES" > /tmp/matched_files.txt
+            MATCH_COUNT=$(echo "$MATCHED_FILES" | grep -v '^$' | wc -l || echo 0)
+            echo "Total matched files: $MATCH_COUNT"
+          fi
+
+      - name: Cherry-pick / Checkout files from source into merger branch
+        id: cherry_pick
+        run: |
+          set -e
+          MERGER_BRANCH="${{ steps.create_branch.outputs.merger_branch }}"
+          git checkout "${MERGER_BRANCH}"
+
+          EXCLUDE_FILES="${{ inputs.exclude_files }}"
+          IFS=',' read -ra EXCLUDE_ARRAY <<< "$EXCLUDE_FILES"
+
+          # Determine which files to deploy
+          if [ -f "/tmp/matched_files.txt" ]; then
+            echo "Deploying matched files from upload/input"
+            FILES_TO_PROCESS=$(cat /tmp/matched_files.txt)
+          elif [ -n "${{ inputs.file_names }}" ] || [ -n "${{ inputs.deployment_file_url }}" ]; then
+            echo "No files matched the requested names"
+            FILES_TO_PROCESS=""
+          else
+            echo "Deploying all changed files (with exclusions)"
+            FILES_TO_PROCESS=$(cat /tmp/all_changed_files.txt || true)
+          fi
+
+          # Apply exclusions
+          FILES_TO_DEPLOY=""
+          while IFS= read -r file; do
+            file=$(echo "$file" | xargs)
+            if [ -z "$file" ]; then
+              continue
+            fi
+            SKIP=false
+            for pat in "${EXCLUDE_ARRAY[@]}"; do
+              pat=$(echo "$pat" | xargs)
+              if [ -z "$pat" ]; then
+                continue
+              fi
+              if echo "$file" | grep -F -q "$pat"; then
+                SKIP=true
+                echo "Excluding: $file (matches exclude pattern: $pat)"
+                break
+              fi
+            done
+            if [ "$SKIP" = false ]; then
+              FILES_TO_DEPLOY="${FILES_TO_DEPLOY}${file}"$'\n'
+            fi
+          done <<< "$FILES_TO_PROCESS"
+
+          echo "$FILES_TO_DEPLOY" > /tmp/files_to_deploy.txt
+
+          DEPLOYED_FILES=""
+          FAILED_FILES=""
+          DEPLOYED_COUNT=0
+
+          git fetch origin "${{ inputs.source_branch }}"
+
+          while IFS= read -r f; do
+            file=$(echo "$f" | xargs)
+            if [ -z "$file" ]; then
+              continue
+            fi
+            echo "Processing: $file"
+            if git cat-file -e "origin/${{ inputs.source_branch }}:${file}" 2>/dev/null; then
+              mkdir -p "$(dirname "$file")" || true
+              if git checkout "origin/${{ inputs.source_branch }}" -- "$file"; then
+                git add --force "$file"
+                DEPLOYED_FILES="${DEPLOYED_FILES}- ${file}"$'\n'
+                DEPLOYED_COUNT=$((DEPLOYED_COUNT + 1))
+                echo "✓ Successfully deployed: $file"
+              else
+                FAILED_FILES="${FAILED_FILES}- ${file} (checkout failed)"$'\n'
+                echo "✗ Failed to checkout: $file"
+              fi
+            else
+              FAILED_FILES="${FAILED_FILES}- ${file} (not found in source branch)"$'\n'
+              echo "✗ File not found in source branch: $file"
+            fi
+          done <<< "$(cat /tmp/files_to_deploy.txt || true)"
+
+          echo "$DEPLOYED_FILES" > /tmp/deployed_files.txt || true
+          echo "$FAILED_FILES" > /tmp/failed_files.txt || true
+          echo "${DEPLOYED_COUNT}" > /tmp/deployed_count.txt || true
+
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "Changes detected"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No changes detected"
+          fi
+
+      - name: Commit changes
+        id: commit_changes
+        if: steps.cherry_pick.outputs.has_changes == 'true'
+        run: |
+          set -e
+          DEPLOYED_FILES=$(cat /tmp/deployed_files.txt || true)
+          DEPLOYED_COUNT=$(cat /tmp/deployed_count.txt || echo 0)
+          git commit -m "Deploy from ${{ inputs.source_branch }} to ${{ inputs.destination_branch }}" \
+                     -m "Deployed ${DEPLOYED_COUNT} file(s):" \
+                     -m "$DEPLOYED_FILES" \
+                     -m "" \
+                     -m "Source: ${{ inputs.source_branch }}" \
+                     -m "Destination: ${{ inputs.destination_branch }}" \
+                     -m "Triggered by: ${{ github.actor }}" || true
+          git push origin "${{ steps.create_branch.outputs.merger_branch }}"
+
+      - name: Restore excluded files from destination (safe)
+        if: steps.cherry_pick.outputs.has_changes == 'true'
+        run: |
+          set -e
+          EXCLUDE_FILES="${{ inputs.exclude_files }}"
+          IFS=',' read -ra EXCLUDE_ARRAY <<< "$EXCLUDE_FILES"
+          RESTORED_FILES=""
+          git fetch origin "${{ inputs.destination_branch }}"
+
+          for exclude_pattern in "${EXCLUDE_ARRAY[@]}"; do
+            exclude_pattern=$(echo "$exclude_pattern" | xargs)
+            if [ -z "$exclude_pattern" ]; then
+              continue
+            fi
+            MATCHING_FILES=$(git ls-tree -r --name-only "origin/${{ inputs.destination_branch }}" | grep -F "$exclude_pattern" || true)
+            if [ -z "$MATCHING_FILES" ]; then
+              echo "No files matched exclude pattern: $exclude_pattern"
+              continue
+            fi
+            while IFS= read -r file; do
+              file=$(echo "$file" | xargs)
+              if [ -z "$file" ]; then
+                continue
+              fi
+              if git cat-file -e "origin/${{ inputs.destination_branch }}:${file}" 2>/dev/null; then
+                git checkout "origin/${{ inputs.destination_branch }}" -- "$file" 2>/dev/null || true
+                RESTORED_FILES="${RESTORED_FILES}- ${file}"$'\n'
+                echo "Restored: $file"
+              fi
+            done <<< "$MATCHING_FILES"
+          done
+
+          if [ -n "$RESTORED_FILES" ] && [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "Restore excluded files from destination branch" -m "Restored files:" -m "$RESTORED_FILES" || true
+            git push origin "${{ steps.create_branch.outputs.merger_branch }}"
+          else
+            echo "No excluded files restored or nothing to commit"
+          fi
+
+      - name: Create Pull Request
+        if: steps.cherry_pick.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        id: create_pr
+        env:
+          GITHUB_TOKEN: ${{ inputs.github_token }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          DESTINATION_BRANCH: ${{ inputs.destination_branch }}
+          MERGER_BRANCH: ${{ steps.create_branch.outputs.merger_branch }}
+          DEPLOYER: ${{ github.actor }}
+          FILE_URL: ${{ inputs.deployment_file_url }}
+        with:
+          github-token: ${{ inputs.github_token }}
+          script: |
+            const fs = require('fs');
+            const deployedFiles = fs.existsSync('/tmp/deployed_files.txt') ? fs.readFileSync('/tmp/deployed_files.txt','utf8') : '';
+            const failedFiles = fs.existsSync('/tmp/failed_files.txt') ? fs.readFileSync('/tmp/failed_files.txt','utf8') : '';
+            const allChanges = fs.existsSync('/tmp/all_changed_files.txt') ? fs.readFileSync('/tmp/all_changed_files.txt','utf8') : '';
+            const deployedCount = fs.existsSync('/tmp/deployed_count.txt') ? fs.readFileSync('/tmp/deployed_count.txt','utf8').trim() : '0';
+            const filesList = allChanges.split('\n').filter(f => f.trim());
+
+            const src = process.env.SOURCE_BRANCH || '';
+            const dst = process.env.DESTINATION_BRANCH || '';
+            const headBranch = process.env.MERGER_BRANCH || '';
+            const actor = process.env.DEPLOYER || '';
+            const fileUrl = process.env.FILE_URL || '';
+
+            let bodyText = '## 🚀 Deployment Request\n\n';
+            bodyText += `**Source Branch:** \`${src}\`\n`;
+            bodyText += `**Destination Branch:** \`${dst}\`\n`;
+            bodyText += `**Triggered by:** @${actor}\n\n`;
+            bodyText += '### 📋 Deployment Summary\n\n';
+
+            if (fileUrl) {
+              bodyText += `**Mode:** File upload deployment\n`;
+              bodyText += `**Deployment file:** ${fileUrl}\n`;
+              bodyText += `**Successfully deployed:** ${deployedCount} files\n\n`;
+            } else if (!fileUrl && deployedCount === '0') {
+              bodyText += `**Mode:** Full deployment (all changes)\n`;
+              bodyText += `**Total changes in source:** ${filesList.length} files\n`;
+              bodyText += `**Successfully deployed:** ${deployedCount} files\n\n`;
+            } else {
+              bodyText += `**Mode:** Selective deployment\n`;
+              bodyText += `**Successfully deployed:** ${deployedCount} files\n\n`;
+            }
+
+            bodyText += '### ✅ Successfully Deployed Files\n';
+            bodyText += '```\n' + (deployedFiles || 'None') + '\n```\n\n';
+
+            if (failedFiles.trim()) {
+              bodyText += '### ⚠️ Failed Files\n';
+              bodyText += '```\n' + failedFiles + '\n```\n\n';
+            }
+
+            bodyText += '### 🔒 Excluded Files (Auto-restored from destination if present)\n';
+            bodyText += '- source.yml\n- relx_fivetran_connector_mapping.csv\n\n';
+
+            bodyText += '### 📝 Next Steps\n';
+            bodyText += '1. Review the changes in this PR\n';
+            bodyText += '2. Approve the PR if everything looks correct\n';
+            bodyText += '3. Merge to deploy to `' + dst + '`\n';
+            bodyText += '4. **Manual Step**: Run your dbt jobs after merge\n\n';
+
+            if (!fileUrl) {
+              bodyText += `### 📊 All Changed Files in Source\n<details><summary>Click to expand (${filesList.length} files)</summary>\n\n`;
+              filesList.forEach(file => {
+                bodyText += `- ${file}\n`;
+              });
+              bodyText += `\n</details>`;
+            }
+
+            const pr = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Deploy: ${src} → ${dst}`,
+              head: headBranch,
+              base: dst,
+              body: bodyText
+            });
+
+            return pr.data.number;
+
+      - name: Add labels to PR
+        if: steps.cherry_pick.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ inputs.github_token }}
+          PR_NUMBER: ${{ steps.create_pr.outputs.result }}
+        with:
+          github-token: ${{ inputs.github_token }}
+          script: |
+            const prNumber = Number(process.env.PR_NUMBER || 0);
+            if (!prNumber) {
+              console.log('No PR number available; skipping label addition.');
+              return;
+            }
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                labels: ['automated-deployment', 'deployment']
+              });
+              console.log('Labels added to PR:', prNumber);
+            } catch (error) {
+              console.log('Could not add labels (they may not exist):', error.message);
+            }
+
+      - name: Summary
+        if: steps.cherry_pick.outputs.has_changes == 'true'
+        run: |
+          echo "## ✅ Deployment PR Created Successfully" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**PR Number:** ${{ steps.create_pr.outputs.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Merger Branch:** \`${{ steps.create_branch.outputs.merger_branch }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          
+          if [ -f "/tmp/deployment_files.txt" ]; then
+            echo "**Deployment Mode:** File Upload" >> "$GITHUB_STEP_SUMMARY"
+          elif [ -n "${{ inputs.file_names }}" ]; then
+            echo "**Deployment Mode:** Manual File List" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "**Deployment Mode:** Full Deployment (All Changes)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Next Steps:" >> "$GITHUB_STEP_SUMMARY"
+          echo "1. Review the PR at the link above" >> "$GITHUB_STEP_SUMMARY"
+          echo "2. Request review from your team" >> "$GITHUB_STEP_SUMMARY"
+          echo "3. Merge after approval" >> "$GITHUB_STEP_SUMMARY"
+          echo "4. **Manually run your dbt jobs after merge**" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: No changes summary
+        if: steps.cherry_pick.outputs.has_changes == 'false'
+        run: |
+          echo "## ℹ️ No Changes to Deploy" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "No differences found between branches or all files were excluded." >> "$GITHUB_STEP_SUMMARY"

@@ -213,7 +213,7 @@ jobs:
             const pr = await github.rest.pulls.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `Deploy: ${src} → ${dst}`,
+              title: `Deployment Request: ${src} → ${dst}`,
               head: headBranch,
               base: dst,
               body: bodyText

@@ -1,4 +1,4 @@
-name: Automated Deployment
+name: Automated Deployment without extention
 
 on:
   workflow_dispatch:

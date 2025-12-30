@@ -1,10 +1,5 @@
-# Automated Branch Deployment with File Upload Support
-# - Accepts CSV/Excel file with deployment file list
-# - Extracts file names from "File Names" column (comma-separated values supported)
-# - Matches files by name only (ignoring extensions)
-# - Creates a temporary merger branch and PR
 
-name: file deployment test
+name: Automated Deployment (SharePoint Input)
 
 on:
   workflow_dispatch:
@@ -21,12 +16,24 @@ on:
         description: 'GitHub Personal Access Token (PAT) with repo and workflow permissions'
         required: true
         type: string
-      deployment_file_url:
-        description: 'URL to CSV/Excel file with deployment list (must be publicly accessible or raw GitHub URL)'
+      sharepoint_file_url:
+        description: >
+          SharePoint link to CSV/XLSX containing a **File Names** column.
+          Each cell may hold a single value or comma-separated values.
+          (We match by base name only; extensions are ignored.)
+        required: true
+        type: string
+      # Optional: only needed if the SharePoint link requires authentication
+      graph_tenant_id:
+        description: 'Entra ID (Azure AD) Tenant ID for Microsoft Graph (optional)'
         required: false
         type: string
-      file_names:
-        description: 'OR: Comma-separated list of files to deploy (leave both empty for all changes)'
+      graph_client_id:
+        description: 'App (Client) ID registered in Entra ID (optional)'
+        required: false
+        type: string
+      graph_client_secret:
+        description: 'Client secret for the app (optional)'
         required: false
         type: string
       exclude_files:
@@ -78,88 +85,145 @@ jobs:
           fi
           echo "Branches validated successfully"
 
-      - name: Process deployment file
-        id: process_file
-        if: inputs.deployment_file_url != ''
+      - name: Process SharePoint file (CSV/XLSX)
+        id: process_sp_file
         run: |
           python3 << 'EOF'
+          import os, sys, base64, re
           import pandas as pd
-          import os
-          import sys
           import requests
           from io import BytesIO
 
-          file_url = "${{ inputs.deployment_file_url }}"
-          
-          if not file_url:
-              print("No deployment file URL provided")
-              sys.exit(0)
-          
-          try:
-              print(f"Downloading file from: {file_url}")
-              response = requests.get(file_url, timeout=30)
-              response.raise_for_status()
-              
-              # Determine file type and read accordingly
-              if file_url.lower().endswith('.csv'):
-                  df = pd.read_csv(BytesIO(response.content))
-              elif file_url.lower().endswith(('.xlsx', '.xls')):
-                  df = pd.read_excel(BytesIO(response.content))
+          sp_url = """${{ inputs.sharepoint_file_url }}""".strip()
+          tenant_id = """${{ inputs.graph_tenant_id }}""".strip()
+          client_id = """${{ inputs.graph_client_id }}""".strip()
+          client_secret = """${{ inputs.graph_client_secret }}""".strip()
+
+          if not sp_url:
+              print("Error: sharepoint_file_url input was empty.")
+              sys.exit(1)
+
+          def is_sharepoint(u:str)->bool:
+              return re.search(r'\.sharepoint\.com', u, re.IGNORECASE) is not None
+
+          def try_direct_download(u:str):
+              print("[SharePoint] Attempting direct download...")
+              r = requests.get(u, timeout=30, allow_redirects=True)
+              if r.status_code == 200:
+                  return r.content
+              # Append &download=1 to force download for many SPO links
+              if "?" in u:
+                  u_dl = u + "&download=1"
               else:
-                  # Try CSV first, then Excel
-                  try:
-                      df = pd.read_csv(BytesIO(response.content))
-                  except:
-                      df = pd.read_excel(BytesIO(response.content))
-              
-              print(f"Successfully loaded file with {len(df)} rows")
-              print(f"Columns found: {list(df.columns)}")
-              
-              # Find the file names column (case-insensitive)
+                  u_dl = u + "?download=1"
+              print(f"[SharePoint] Retrying with force-download: {u_dl}")
+              r = requests.get(u_dl, timeout=30, allow_redirects=True)
+              if r.status_code == 200:
+                  return r.content
+              print(f"[SharePoint] Direct download failed with status {r.status_code}")
+              return None
+
+          def graph_download_via_shares(u:str):
+              if not (tenant_id and client_id and client_secret):
+                  raise RuntimeError("This SharePoint link may require auth. Provide graph_tenant_id, graph_client_id, and graph_client_secret.")
+
+              # Client credentials flow for Microsoft Graph
+              token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+              data = {
+                  "client_id": client_id,
+                  "client_secret": client_secret,
+                  "grant_type": "client_credentials",
+                  "scope": "https://graph.microsoft.com/.default"
+              }
+              print("[Graph] Requesting OAuth token...")
+              t = requests.post(token_url, data=data, timeout=30)
+              t.raise_for_status()
+              access_token = t.json()["access_token"]
+
+              # Encode sharing URL: base64 -> unpadded base64url -> prefix u!
+              b64 = base64.b64encode(u.encode("utf-8")).decode("utf-8")
+              encoded = "u!" + b64.rstrip("=").replace("/", "_").replace("+", "-")
+              endpoint = f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem/content"
+              print(f"[Graph] Download via shares endpoint: {endpoint}")
+
+              resp = requests.get(
+                  endpoint,
+                  headers={"Authorization": f"Bearer {access_token}"},
+                  allow_redirects=True, timeout=60
+              )
+              resp.raise_for_status()
+              return resp.content
+
+          def load_dataframe(content: bytes, url_hint: str):
+              lower = url_hint.lower()
+              try:
+                  if lower.endswith(".csv"):
+                      return pd.read_csv(BytesIO(content))
+                  elif lower.endswith(".xlsx") or lower.endswith(".xls"):
+                      return pd.read_excel(BytesIO(content))
+                  else:
+                      # Try CSV, then Excel
+                      try:
+                          return pd.read_csv(BytesIO(content))
+                      except Exception:
+                          return pd.read_excel(BytesIO(content))
+              except Exception as e:
+                  raise RuntimeError(f"Failed to parse file: {e}")
+
+          def extract_names(df: pd.DataFrame):
+              print(f"[Parser] Columns available: {list(df.columns)}")
               file_col = None
               for col in df.columns:
-                  if 'file' in str(col).lower() and 'name' in str(col).lower():
+                  s = str(col).lower()
+                  if "file" in s and "name" in s:
                       file_col = col
                       break
-              
-              if file_col is None:
-                  print("Error: Could not find 'File Names' column in the file")
-                  print(f"Available columns: {list(df.columns)}")
-                  sys.exit(1)
-              
-              print(f"Using column: {file_col}")
-              
-              # Extract and process file names
+              if not file_col:
+                  raise RuntimeError("Could not find a 'File Names' column.")
+
               all_files = []
-              for value in df[file_col].dropna():
-                  # Split by comma and clean up each file name
-                  files = str(value).split(',')
-                  for f in files:
+              for val in df[file_col].dropna():
+                  # Each cell can have a single value or comma-separated list
+                  for f in str(val).split(","):
                       f = f.strip()
-                      if f:  # Skip empty strings
-                          # Remove any extensions if present
-                          base_name = f.rsplit('.', 1)[0] if '.' in f else f
-                          all_files.append(base_name)
-              
-              # Remove duplicates while preserving order
+                      if f:
+                          # Strip extension if provided
+                          base = f.rsplit(".", 1)[0] if "." in f else f
+                          all_files.append(base)
+
+              # Deduplicate while preserving order
               unique_files = list(dict.fromkeys(all_files))
-              
-              print(f"Extracted {len(unique_files)} unique file names")
-              print("Files to deploy:")
+              if not unique_files:
+                  raise RuntimeError("No file names extracted from 'File Names' column.")
+
+              # Persist for downstream steps
+              with open("/tmp/deployment_files.txt", "w") as fh:
+                  fh.write("\n".join(unique_files))
+
+              print(f"[Parser] Extracted {len(unique_files)} unique base names:")
               for f in unique_files:
                   print(f"  - {f}")
-              
-              # Write to output file
-              with open('/tmp/deployment_files.txt', 'w') as out:
-                  out.write('\n'.join(unique_files))
-              
-              print(f"\nTotal files to deploy: {len(unique_files)}")
-              
-          except Exception as e:
-              print(f"Error processing deployment file: {str(e)}")
-              import traceback
-              traceback.print_exc()
+
+          # ---- Main flow ----
+          content = None
+          if is_sharepoint(sp_url):
+              content = try_direct_download(sp_url)
+              if content is None:
+                  print("[SharePoint] Falling back to Microsoft Graph...")
+                  content = graph_download_via_shares(sp_url)
+          else:
+              print("[Generic] Non-SharePoint URL; fetching via HTTP.")
+              r = requests.get(sp_url, timeout=30, allow_redirects=True)
+              r.raise_for_status()
+              content = r.content
+
+          if content is None:
+              print("Error: Unable to download content from the provided SharePoint link.")
               sys.exit(1)
+
+          df = load_dataframe(content, sp_url)
+          print(f"[Parser] Loaded {len(df)} row(s)")
+          extract_names(df)
           EOF
 
       - name: Create merger branch (sanitized name)
@@ -187,54 +251,38 @@ jobs:
           echo "total_changes=${FILE_COUNT}" >> "$GITHUB_OUTPUT"
           echo "Total files changed: ${FILE_COUNT}"
 
-      - name: Match files by name (ignoring extensions)
+      - name: Match files by name (ignore extensions)
         id: match_files
         run: |
           set -e
-          
-          # Determine source of file names
           if [ -f "/tmp/deployment_files.txt" ]; then
-            echo "Using file names from uploaded deployment file"
-            FILE_NAMES_SOURCE="/tmp/deployment_files.txt"
-          elif [ -n "${{ inputs.file_names }}" ]; then
-            echo "Using file names from manual input"
-            echo "${{ inputs.file_names }}" | tr ',' '\n' > /tmp/deployment_files.txt
+            echo "Using file names from SharePoint input"
             FILE_NAMES_SOURCE="/tmp/deployment_files.txt"
           else
-            echo "No specific files requested - will deploy all changes"
+            echo "No SharePoint file names parsed; will deploy all changes"
             FILE_NAMES_SOURCE=""
           fi
-          
-          # If we have specific file names, match them against actual files
+
           if [ -n "$FILE_NAMES_SOURCE" ]; then
             MATCHED_FILES=""
-            
-            # Get all files from source branch
             ALL_SOURCE_FILES=$(git ls-tree -r --name-only "origin/${{ inputs.source_branch }}")
-            
-            # Read requested file names (without extensions)
+
             while IFS= read -r requested_name; do
               requested_name=$(echo "$requested_name" | xargs)
               if [ -z "$requested_name" ]; then
                 continue
               fi
-              
               echo "Looking for files matching: $requested_name"
-              
-              # Search for files that match this name (ignoring extension)
               while IFS= read -r source_file; do
-                # Get basename without extension
                 file_basename=$(basename "$source_file")
                 file_without_ext="${file_basename%.*}"
-                
-                # Match if the name matches (case-insensitive)
                 if [ "$(echo "$file_without_ext" | tr '[:upper:]' '[:lower:]')" = "$(echo "$requested_name" | tr '[:upper:]' '[:lower:]')" ]; then
                   echo "  ✓ Matched: $source_file"
                   MATCHED_FILES="${MATCHED_FILES}${source_file}"$'\n'
                 fi
               done <<< "$ALL_SOURCE_FILES"
             done < "$FILE_NAMES_SOURCE"
-            
+
             echo "$MATCHED_FILES" > /tmp/matched_files.txt
             MATCH_COUNT=$(echo "$MATCHED_FILES" | grep -v '^$' | wc -l || echo 0)
             echo "Total matched files: $MATCH_COUNT"
@@ -252,29 +300,21 @@ jobs:
 
           # Determine which files to deploy
           if [ -f "/tmp/matched_files.txt" ]; then
-            echo "Deploying matched files from upload/input"
+            echo "Deploying matched files from SharePoint input"
             FILES_TO_PROCESS=$(cat /tmp/matched_files.txt)
-          elif [ -n "${{ inputs.file_names }}" ] || [ -n "${{ inputs.deployment_file_url }}" ]; then
-            echo "No files matched the requested names"
-            FILES_TO_PROCESS=""
           else
             echo "Deploying all changed files (with exclusions)"
             FILES_TO_PROCESS=$(cat /tmp/all_changed_files.txt || true)
           fi
 
-          # Apply exclusions
           FILES_TO_DEPLOY=""
           while IFS= read -r file; do
             file=$(echo "$file" | xargs)
-            if [ -z "$file" ]; then
-              continue
-            fi
+            [ -z "$file" ] && continue
             SKIP=false
             for pat in "${EXCLUDE_ARRAY[@]}"; do
               pat=$(echo "$pat" | xargs)
-              if [ -z "$pat" ]; then
-                continue
-              fi
+              [ -z "$pat" ] && continue
               if echo "$file" | grep -F -q "$pat"; then
                 SKIP=true
                 echo "Excluding: $file (matches exclude pattern: $pat)"
@@ -296,9 +336,7 @@ jobs:
 
           while IFS= read -r f; do
             file=$(echo "$f" | xargs)
-            if [ -z "$file" ]; then
-              continue
-            fi
+            [ -z "$file" ] && continue
             echo "Processing: $file"
             if git cat-file -e "origin/${{ inputs.source_branch }}:${file}" 2>/dev/null; then
               mkdir -p "$(dirname "$file")" || true
@@ -356,19 +394,12 @@ jobs:
 
           for exclude_pattern in "${EXCLUDE_ARRAY[@]}"; do
             exclude_pattern=$(echo "$exclude_pattern" | xargs)
-            if [ -z "$exclude_pattern" ]; then
-              continue
-            fi
+            [ -z "$exclude_pattern" ] && continue
             MATCHING_FILES=$(git ls-tree -r --name-only "origin/${{ inputs.destination_branch }}" | grep -F "$exclude_pattern" || true)
-            if [ -z "$MATCHING_FILES" ]; then
-              echo "No files matched exclude pattern: $exclude_pattern"
-              continue
-            fi
+            [ -z "$MATCHING_FILES" ] && { echo "No files matched exclude pattern: $exclude_pattern"; continue; }
             while IFS= read -r file; do
               file=$(echo "$file" | xargs)
-              if [ -z "$file" ]; then
-                continue
-              fi
+              [ -z "$file" ] && continue
               if git cat-file -e "origin/${{ inputs.destination_branch }}:${file}" 2>/dev/null; then
                 git checkout "origin/${{ inputs.destination_branch }}" -- "$file" 2>/dev/null || true
                 RESTORED_FILES="${RESTORED_FILES}- ${file}"$'\n'
@@ -395,7 +426,7 @@ jobs:
           DESTINATION_BRANCH: ${{ inputs.destination_branch }}
           MERGER_BRANCH: ${{ steps.create_branch.outputs.merger_branch }}
           DEPLOYER: ${{ github.actor }}
-          FILE_URL: ${{ inputs.deployment_file_url }}
+          SHAREPOINT_URL: ${{ inputs.sharepoint_file_url }}
         with:
           github-token: ${{ inputs.github_token }}
           script: |
@@ -410,56 +441,42 @@ jobs:
             const dst = process.env.DESTINATION_BRANCH || '';
             const headBranch = process.env.MERGER_BRANCH || '';
             const actor = process.env.DEPLOYER || '';
-            const fileUrl = process.env.FILE_URL || '';
+            const spUrl = process.env.SHAREPOINT_URL || '';
 
-            let bodyText = '## 🚀 Deployment Request\n\n';
-            bodyText += `**Source Branch:** \`${src}\`\n`;
-            bodyText += `**Destination Branch:** \`${dst}\`\n`;
-            bodyText += `**Triggered by:** @${actor}\n\n`;
-            bodyText += '### 📋 Deployment Summary\n\n';
+            let bodyText = '## 🚀 Deployment Request (SharePoint Input)\\n\\n';
+            bodyText += `**Source Branch:** \\`${src}\\`\\n`;
+            bodyText += `**Destination Branch:** \\`${dst}\\`\\n`;
+            bodyText += `**Triggered by:** @${actor}\\n\\n`;
+            bodyText += '### 📋 Deployment Summary\\n\\n';
+            bodyText += `**Mode:** SharePoint file link\\n`;
+            bodyText += `**Deployment file:** ${spUrl}\\n`;
+            bodyText += `**Successfully deployed:** ${deployedCount} files\\n\\n`;
 
-            if (fileUrl) {
-              bodyText += `**Mode:** File upload deployment\n`;
-              bodyText += `**Deployment file:** ${fileUrl}\n`;
-              bodyText += `**Successfully deployed:** ${deployedCount} files\n\n`;
-            } else if (!fileUrl && deployedCount === '0') {
-              bodyText += `**Mode:** Full deployment (all changes)\n`;
-              bodyText += `**Total changes in source:** ${filesList.length} files\n`;
-              bodyText += `**Successfully deployed:** ${deployedCount} files\n\n`;
-            } else {
-              bodyText += `**Mode:** Selective deployment\n`;
-              bodyText += `**Successfully deployed:** ${deployedCount} files\n\n`;
-            }
-
-            bodyText += '### ✅ Successfully Deployed Files\n';
-            bodyText += '```\n' + (deployedFiles || 'None') + '\n```\n\n';
+            bodyText += '### ✅ Successfully Deployed Files\\n';
+            bodyText += '```\\n' + (deployedFiles || 'None') + '\\n```\\n\\n';
 
             if (failedFiles.trim()) {
-              bodyText += '### ⚠️ Failed Files\n';
-              bodyText += '```\n' + failedFiles + '\n```\n\n';
+              bodyText += '### ⚠️ Failed Files\\n';
+              bodyText += '```\\n' + failedFiles + '\\n```\\n\\n';
             }
 
-            bodyText += '### 🔒 Excluded Files (Auto-restored from destination if present)\n';
-            bodyText += '- source.yml\n- relx_fivetran_connector_mapping.csv\n\n';
+            bodyText += '### 🔒 Excluded Files (Auto-restored from destination if present)\\n';
+            bodyText += '- source.yml\\n- relx_fivetran_connector_mapping.csv\\n\\n';
 
-            bodyText += '### 📝 Next Steps\n';
-            bodyText += '1. Review the changes in this PR\n';
-            bodyText += '2. Approve the PR if everything looks correct\n';
-            bodyText += '3. Merge to deploy to `' + dst + '`\n';
-            bodyText += '4. **Manual Step**: Run your dbt jobs after merge\n\n';
+            bodyText += '### 📝 Next Steps\\n';
+            bodyText += '1. Review the changes in this PR\\n';
+            bodyText += '2. Approve the PR if everything looks correct\\n';
+            bodyText += '3. Merge to deploy to `' + dst + '`\\n';
+            bodyText += '4. **Manual Step**: Run your dbt jobs after merge\\n\\n';
 
-            if (!fileUrl) {
-              bodyText += `### 📊 All Changed Files in Source\n<details><summary>Click to expand (${filesList.length} files)</summary>\n\n`;
-              filesList.forEach(file => {
-                bodyText += `- ${file}\n`;
-              });
-              bodyText += `\n</details>`;
-            }
+            bodyText += `### 📊 All Changed Files in Source\\n<details><summary>Click to expand (${filesList.length} files)</summary>\\n\\n`;
+            filesList.forEach(file => { bodyText += `- ${file}\\n`; });
+            bodyText += `\\n</details>`;
 
             const pr = await github.rest.pulls.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `Deploy: ${src} → ${dst}`,
+              title: `Deploy: ${src} → ${dst} (SharePoint file)`,
               head: headBranch,
               base: dst,
               body: bodyText
@@ -486,7 +503,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: prNumber,
-                labels: ['automated-deployment', 'deployment']
+                labels: ['automated-deployment', 'deployment', 'sharepoint-input']
               });
               console.log('Labels added to PR:', prNumber);
             } catch (error) {
@@ -501,15 +518,8 @@ jobs:
           echo "**PR Number:** ${{ steps.create_pr.outputs.result }}" >> "$GITHUB_STEP_SUMMARY"
           echo "**Merger Branch:** \`${{ steps.create_branch.outputs.merger_branch }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          
-          if [ -f "/tmp/deployment_files.txt" ]; then
-            echo "**Deployment Mode:** File Upload" >> "$GITHUB_STEP_SUMMARY"
-          elif [ -n "${{ inputs.file_names }}" ]; then
-            echo "**Deployment Mode:** Manual File List" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "**Deployment Mode:** Full Deployment (All Changes)" >> "$GITHUB_STEP_SUMMARY"
-          fi
-          
+          echo "**Deployment Mode:** SharePoint Link" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Deployment File:** ${{ inputs.sharepoint_file_url }}" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "### Next Steps:" >> "$GITHUB_STEP_SUMMARY"
           echo "1. Review the PR at the link above" >> "$GITHUB_STEP_SUMMARY"

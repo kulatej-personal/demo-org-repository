@@ -1,4 +1,4 @@
-name: Automated Deployment without extensions
+name: Automated Deployment
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       github_token:
-        description: 'GitHub Personal Access Token (PAT) with repo permissions'
+        description: 'GitHub Personal Access Token (PAT)'
         required: true
         type: string
       file_names:
@@ -65,7 +65,7 @@ jobs:
           git checkout -b "${MERGER_BRANCH}" "origin/${{ inputs.destination_branch }}"
           git push -u origin "${MERGER_BRANCH}"
 
-      - name: Get changed files from source branch
+      - name: Get changed files
         run: |
           git fetch origin "${{ inputs.source_branch }}"
           git diff --name-only --diff-filter=ACMR \
@@ -85,11 +85,10 @@ jobs:
           IFS=',' read -ra EXCLUDE_ARRAY <<< "$EXCLUDE_FILES"
 
           FILES_TO_DEPLOY=""
-          FAILED_FILES=""
           DEPLOYED_FILES=""
+          FAILED_FILES=""
           DEPLOYED_COUNT=0
 
-          # ---------- FILE RESOLUTION ----------
           if [ -z "$FILE_NAMES_INPUT" ]; then
             FILES_TO_DEPLOY="$CHANGED_FILES"
           else
@@ -108,7 +107,7 @@ jobs:
               if [ -n "$MATCH" ]; then
                 FILES_TO_DEPLOY="${FILES_TO_DEPLOY}${MATCH}"$'\n'
               else
-                FAILED_FILES="${FAILED_FILES}- ${input} (no matching file found)"$'\n'
+                FAILED_FILES="${FAILED_FILES}- ${input} (no match found)"$'\n'
               fi
             done
           fi
@@ -152,33 +151,14 @@ jobs:
         run: |
           COUNT=$(cat /tmp/deployed_count.txt)
           FILES=$(cat /tmp/deployed_files.txt)
-          git commit -m "Deploy from ${{ inputs.source_branch }} to ${{ inputs.destination_branch }}" \
-                     -m "Deployed ${COUNT} file(s):" \
+          git commit -m "Deploy ${COUNT} file(s) from ${{ inputs.source_branch }} to ${{ inputs.destination_branch }}" \
                      -m "$FILES"
           git push origin "${{ steps.create_branch.outputs.merger_branch }}"
-
-      - name: Restore excluded files from destination
-        if: steps.cherry_pick.outputs.has_changes == 'true'
-        run: |
-          set -e
-          IFS=',' read -ra EXCLUDE_ARRAY <<< "${{ inputs.exclude_files }}"
-          git fetch origin "${{ inputs.destination_branch }}"
-
-          for pat in "${EXCLUDE_ARRAY[@]}"; do
-            git checkout "origin/${{ inputs.destination_branch }}" -- $(git ls-tree -r --name-only "origin/${{ inputs.destination_branch }}" | grep -F "$pat" || true) || true
-          done
-
-          if [ -n "$(git status --porcelain)" ]; then
-            git add -A
-            git commit -m "Restore excluded files from destination branch"
-            git push origin "${{ steps.create_branch.outputs.merger_branch }}"
-          fi
 
       - name: Create Pull Request
         if: steps.cherry_pick.outputs.has_changes == 'true'
         uses: actions/github-script@v7
         env:
-          GITHUB_TOKEN: ${{ inputs.github_token }}
           SOURCE_BRANCH: ${{ inputs.source_branch }}
           DESTINATION_BRANCH: ${{ inputs.destination_branch }}
           MERGER_BRANCH: ${{ steps.create_branch.outputs.merger_branch }}
@@ -188,54 +168,44 @@ jobs:
           script: |
             const fs = require('fs');
 
-            const deployed = fs.existsSync('/tmp/deployed_files.txt')
-              ? fs.readFileSync('/tmp/deployed_files.txt', 'utf8')
-              : '';
-
-            const failed = fs.existsSync('/tmp/failed_files.txt')
-              ? fs.readFileSync('/tmp/failed_files.txt', 'utf8')
-              : '';
-
-            const count = fs.existsSync('/tmp/deployed_count.txt')
-              ? fs.readFileSync('/tmp/deployed_count.txt', 'utf8').trim()
-              : '0';
+            const deployed = fs.readFileSync('/tmp/deployed_files.txt','utf8');
+            const failed = fs.readFileSync('/tmp/failed_files.txt','utf8');
+            const count = fs.readFileSync('/tmp/deployed_count.txt','utf8').trim();
 
             const src = process.env.SOURCE_BRANCH;
             const dst = process.env.DESTINATION_BRANCH;
             const actor = process.env.DEPLOYER;
-            const headBranch = process.env.MERGER_BRANCH;
+            const head = process.env.MERGER_BRANCH;
 
-            let body = `## 🚀 Deployment Request
-
-**Source:** \`${src}\`
-**Destination:** \`${dst}\`
-**Triggered by:** @${actor}
-**Deployed:** ${count} file(s)
-
-### ✅ Deployed Files
-\`\`\`
-${deployed || 'None'}
-\`\`\`
-`;
+            let body =
+              'DEPLOYMENT REQUEST\n\n' +
+              'Source: ' + src + '\n' +
+              'Destination: ' + dst + '\n' +
+              'Triggered by: ' + actor + '\n' +
+              'Deployed files: ' + count + '\n\n' +
+              'DEPLOYED FILES\n' +
+              '----------------\n' +
+              (deployed || 'None') + '\n';
 
             if (failed.trim()) {
-              body += `
-### ⚠️ Failed Files
-\`\`\`
-${failed}
-\`\`\`
-`;
+              body += '\nFAILED FILES\n----------------\n' + failed;
             }
 
             await github.rest.pulls.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `Deploy: ${src} → ${dst}`,
-              head: headBranch,
+              title: 'Deploy: ' + src + ' -> ' + dst,
+              head: head,
               base: dst,
-              body
+              body: body
             });
 
       - name: Summary
+        if: steps.cherry_pick.outputs.has_changes == 'true'
         run: |
-          echo "## ✅ Deployment workflow completed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deployment PR created successfully" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: No changes summary
+        if: steps.cherry_pick.outputs.has_changes == 'false'
+        run: |
+          echo "No changes to deploy" >> "$GITHUB_STEP_SUMMARY"

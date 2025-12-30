@@ -1,4 +1,4 @@
-name: Automated Deployment without extention
+name: Automated Deployment
 
 on:
   workflow_dispatch:
@@ -28,6 +28,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 jobs:
   create-deployment-pr:
@@ -93,17 +94,14 @@ jobs:
             FILES_TO_DEPLOY="$CHANGED_FILES"
           else
             IFS=',' read -ra INPUT_FILES <<< "$FILE_NAMES_INPUT"
-
             for input in "${INPUT_FILES[@]}"; do
               input=$(echo "$input" | xargs)
               [ -z "$input" ] && continue
-
               if echo "$input" | grep -q '\.'; then
                 MATCH=$(echo "$CHANGED_FILES" | grep -Fx "$input" || true)
               else
                 MATCH=$(echo "$CHANGED_FILES" | grep -E "(^|/)${input}\.[a-zA-Z0-9]+$" || true)
               fi
-
               if [ -n "$MATCH" ]; then
                 FILES_TO_DEPLOY="${FILES_TO_DEPLOY}${MATCH}"$'\n'
               else
@@ -116,24 +114,17 @@ jobs:
           git fetch origin "${{ inputs.source_branch }}"
 
           while IFS= read -r file; do
-            file=$(echo "$file" | xargs)
             [ -z "$file" ] && continue
-
             SKIP=false
             for ex in "${EXCLUDE_ARRAY[@]}"; do
-              if echo "$file" | grep -Fq "$ex"; then
-                SKIP=true
-              fi
+              echo "$file" | grep -Fq "$ex" && SKIP=true
             done
             [ "$SKIP" = true ] && continue
 
-            if git cat-file -e "origin/${{ inputs.source_branch }}:${file}" 2>/dev/null; then
-              mkdir -p "$(dirname "$file")"
-              git checkout "origin/${{ inputs.source_branch }}" -- "$file"
-              git add "$file"
-              DEPLOYED_FILES="${DEPLOYED_FILES}- ${file}"$'\n'
-              DEPLOYED_COUNT=$((DEPLOYED_COUNT + 1))
-            fi
+            git checkout "origin/${{ inputs.source_branch }}" -- "$file"
+            git add "$file"
+            DEPLOYED_FILES="${DEPLOYED_FILES}- ${file}"$'\n'
+            DEPLOYED_COUNT=$((DEPLOYED_COUNT + 1))
           done < /tmp/files_to_deploy.txt
 
           echo "$DEPLOYED_FILES" > /tmp/deployed_files.txt
@@ -149,20 +140,17 @@ jobs:
       - name: Commit changes
         if: steps.cherry_pick.outputs.has_changes == 'true'
         run: |
-          COUNT=$(cat /tmp/deployed_count.txt)
-          FILES=$(cat /tmp/deployed_files.txt)
-          git commit -m "Deploy ${COUNT} file(s) from ${{ inputs.source_branch }} to ${{ inputs.destination_branch }}" \
-                     -m "$FILES"
+          git commit -m "Automated deployment"
           git push origin "${{ steps.create_branch.outputs.merger_branch }}"
 
       - name: Create Pull Request
+        id: create_pr
         if: steps.cherry_pick.outputs.has_changes == 'true'
         uses: actions/github-script@v7
         env:
           SOURCE_BRANCH: ${{ inputs.source_branch }}
           DESTINATION_BRANCH: ${{ inputs.destination_branch }}
           MERGER_BRANCH: ${{ steps.create_branch.outputs.merger_branch }}
-          DEPLOYER: ${{ github.actor }}
         with:
           github-token: ${{ inputs.github_token }}
           script: |
@@ -174,38 +162,48 @@ jobs:
 
             const src = process.env.SOURCE_BRANCH;
             const dst = process.env.DESTINATION_BRANCH;
-            const actor = process.env.DEPLOYER;
             const head = process.env.MERGER_BRANCH;
 
-            let body =
-              'DEPLOYMENT REQUEST\n\n' +
+            const body =
+              'Deployment Request\n\n' +
               'Source: ' + src + '\n' +
               'Destination: ' + dst + '\n' +
-              'Triggered by: ' + actor + '\n' +
               'Deployed files: ' + count + '\n\n' +
               'DEPLOYED FILES\n' +
-              '----------------\n' +
-              (deployed || 'None') + '\n';
+              deployed +
+              (failed.trim() ? '\nFAILED FILES\n' + failed : '');
 
-            if (failed.trim()) {
-              body += '\nFAILED FILES\n----------------\n' + failed;
-            }
-
-            await github.rest.pulls.create({
+            const pr = await github.rest.pulls.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: 'Deploy: ' + src + ' -> ' + dst,
-              head: head,
+              head,
               base: dst,
-              body: body
+              body
+            });
+
+            return pr.data.number;
+
+      - name: Add labels to PR
+        if: steps.cherry_pick.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.create_pr.outputs.result }}
+        with:
+          github-token: ${{ inputs.github_token }}
+          script: |
+            const prNumber = Number(process.env.PR_NUMBER || 0);
+            if (!prNumber) {
+              console.log('No PR number available; skipping label addition.');
+              return;
+            }
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              labels: ['automated-deployment', 'deployment']
             });
 
       - name: Summary
-        if: steps.cherry_pick.outputs.has_changes == 'true'
         run: |
-          echo "Deployment PR created successfully" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: No changes summary
-        if: steps.cherry_pick.outputs.has_changes == 'false'
-        run: |
-          echo "No changes to deploy" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deployment workflow completed" >> "$GITHUB_STEP_SUMMARY"

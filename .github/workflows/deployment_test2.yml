@@ -1,0 +1,223 @@
+name: Automated Deployment without extensions
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: 'Source branch to deploy from'
+        required: true
+        type: string
+      destination_branch:
+        description: 'Destination branch to deploy to'
+        required: true
+        type: string
+      github_token:
+        description: 'GitHub Personal Access Token (PAT) with repo permissions'
+        required: true
+        type: string
+      file_names:
+        description: 'Comma-separated list of files (extension optional)'
+        required: false
+        type: string
+      exclude_files:
+        description: 'Files to exclude'
+        required: false
+        type: string
+        default: 'source.yml,relx_fivetran_connector_mapping.csv'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create-deployment-pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ inputs.github_token }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+      - name: Validate branches exist
+        run: |
+          set -e
+          git ls-remote --heads origin "${{ inputs.source_branch }}" | grep -q refs/heads
+          git ls-remote --heads origin "${{ inputs.destination_branch }}" | grep -q refs/heads
+
+      - name: Create merger branch
+        id: create_branch
+        run: |
+          set -e
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          SRC=$(echo "${{ inputs.source_branch }}" | tr '[:upper:]' '[:lower:]' | sed 's/[\/ ]/_/g')
+          DST=$(echo "${{ inputs.destination_branch }}" | tr '[:upper:]' '[:lower:]' | sed 's/[\/ ]/_/g')
+          MERGER_BRANCH="${SRC}_to_${DST}_merger_${TIMESTAMP}"
+          echo "merger_branch=${MERGER_BRANCH}" >> "$GITHUB_OUTPUT"
+
+          git fetch origin "${{ inputs.destination_branch }}"
+          git checkout -b "${MERGER_BRANCH}" "origin/${{ inputs.destination_branch }}"
+          git push -u origin "${MERGER_BRANCH}"
+
+      - name: Get changed files from source branch
+        run: |
+          git fetch origin "${{ inputs.source_branch }}"
+          git diff --name-only --diff-filter=ACMR \
+            "origin/${{ inputs.destination_branch }}...origin/${{ inputs.source_branch }}" \
+            > /tmp/all_changed_files.txt || true
+
+      - name: Cherry-pick / Checkout files
+        id: cherry_pick
+        run: |
+          set -e
+          git checkout "${{ steps.create_branch.outputs.merger_branch }}"
+
+          FILE_NAMES_INPUT="${{ inputs.file_names }}"
+          EXCLUDE_FILES="${{ inputs.exclude_files }}"
+          CHANGED_FILES=$(cat /tmp/all_changed_files.txt || true)
+
+          IFS=',' read -ra EXCLUDE_ARRAY <<< "$EXCLUDE_FILES"
+
+          FILES_TO_DEPLOY=""
+          FAILED_FILES=""
+          DEPLOYED_FILES=""
+          DEPLOYED_COUNT=0
+
+          # ---------- FILE RESOLUTION ----------
+          if [ -z "$FILE_NAMES_INPUT" ]; then
+            FILES_TO_DEPLOY="$CHANGED_FILES"
+          else
+            IFS=',' read -ra INPUT_FILES <<< "$FILE_NAMES_INPUT"
+
+            for input in "${INPUT_FILES[@]}"; do
+              input=$(echo "$input" | xargs)
+              [ -z "$input" ] && continue
+
+              if echo "$input" | grep -q '\.'; then
+                MATCH=$(echo "$CHANGED_FILES" | grep -Fx "$input" || true)
+              else
+                MATCH=$(echo "$CHANGED_FILES" | grep -E "(^|/)${input}\.[a-zA-Z0-9]+$" || true)
+              fi
+
+              if [ -n "$MATCH" ]; then
+                FILES_TO_DEPLOY="${FILES_TO_DEPLOY}${MATCH}"$'\n'
+              else
+                FAILED_FILES="${FAILED_FILES}- ${input} (no matching file found)"$'\n'
+              fi
+            done
+          fi
+
+          echo "$FILES_TO_DEPLOY" | sort -u > /tmp/files_to_deploy.txt
+          git fetch origin "${{ inputs.source_branch }}"
+
+          while IFS= read -r file; do
+            file=$(echo "$file" | xargs)
+            [ -z "$file" ] && continue
+
+            SKIP=false
+            for ex in "${EXCLUDE_ARRAY[@]}"; do
+              if echo "$file" | grep -Fq "$ex"; then
+                SKIP=true
+              fi
+            done
+            [ "$SKIP" = true ] && continue
+
+            if git cat-file -e "origin/${{ inputs.source_branch }}:${file}" 2>/dev/null; then
+              mkdir -p "$(dirname "$file")"
+              git checkout "origin/${{ inputs.source_branch }}" -- "$file"
+              git add "$file"
+              DEPLOYED_FILES="${DEPLOYED_FILES}- ${file}"$'\n'
+              DEPLOYED_COUNT=$((DEPLOYED_COUNT + 1))
+            fi
+          done < /tmp/files_to_deploy.txt
+
+          echo "$DEPLOYED_FILES" > /tmp/deployed_files.txt
+          echo "$FAILED_FILES" > /tmp/failed_files.txt
+          echo "$DEPLOYED_COUNT" > /tmp/deployed_count.txt
+
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit changes
+        if: steps.cherry_pick.outputs.has_changes == 'true'
+        run: |
+          COUNT=$(cat /tmp/deployed_count.txt)
+          FILES=$(cat /tmp/deployed_files.txt)
+          git commit -m "Deploy from ${{ inputs.source_branch }} to ${{ inputs.destination_branch }}" \
+                     -m "Deployed ${COUNT} file(s):" \
+                     -m "$FILES"
+          git push origin "${{ steps.create_branch.outputs.merger_branch }}"
+
+      - name: Restore excluded files from destination
+        if: steps.cherry_pick.outputs.has_changes == 'true'
+        run: |
+          set -e
+          IFS=',' read -ra EXCLUDE_ARRAY <<< "${{ inputs.exclude_files }}"
+          git fetch origin "${{ inputs.destination_branch }}"
+
+          for pat in "${EXCLUDE_ARRAY[@]}"; do
+            git checkout "origin/${{ inputs.destination_branch }}" -- $(git ls-tree -r --name-only "origin/${{ inputs.destination_branch }}" | grep -F "$pat" || true) || true
+          done
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "Restore excluded files from destination branch"
+            git push origin "${{ steps.create_branch.outputs.merger_branch }}"
+          fi
+
+      - name: Create Pull Request
+        if: steps.cherry_pick.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ inputs.github_token }}
+        with:
+          github-token: ${{ inputs.github_token }}
+          script: |
+            const fs = require('fs');
+
+            const deployed = fs.readFileSync('/tmp/deployed_files.txt','utf8');
+            const failed = fs.readFileSync('/tmp/failed_files.txt','utf8');
+            const count = fs.readFileSync('/tmp/deployed_count.txt','utf8').trim();
+
+            let body = `## 🚀 Deployment Request
+
+**Source:** \`${{ inputs.source_branch }}\`
+**Destination:** \`${{ inputs.destination_branch }}\`
+**Deployed:** ${count} file(s)
+
+### ✅ Deployed Files
+\`\`\`
+${deployed || 'None'}
+\`\`\`
+`;
+
+            if (failed.trim()) {
+              body += `
+### ⚠️ Failed Files
+\`\`\`
+${failed}
+\`\`\`
+`;
+            }
+
+            await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Deploy: ${{ inputs.source_branch }} → ${{ inputs.destination_branch }}`,
+              head: '${{ steps.create_branch.outputs.merger_branch }}',
+              base: '${{ inputs.destination_branch }}',
+              body
+            });
+
+      - name: Summary
+        run: |
+          echo "## ✅ Deployment workflow completed" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,161 @@
+name: "relx_1finance_dbt"
+version: "1.0.0"
+config-version: 2
+
+# This setting configures which "profile" dbt uses for this project.
+profile: "default"
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  relx_1finance_dbt:
+    1F_Analytics_DB:
+      STG_1F:
+        +materialized: table
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "STG_1F"
+        +tags: "STG_1F"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+
+      STG_LOGS:
+        +materialized: table
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "STG_LOGS"
+        +tags: "STG_LOGS"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+
+ 
+      STG_EDI_RIS:
+        +materialized: table
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "STG_EDI_RIS"
+        +tags: "STG_EDI_RIS"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+
+
+      STG_SFU_RIS:
+        +materialized: table
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "STG_SFU_RIS"
+        +tags: "STG_SFU_RIS"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+
+
+      STG_R12_ELS:
+        +materialized: table
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "STG_R12_ELS"
+        +tags: "STG_R12_ELS"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+
+
+      STG_WD:
+        +materialized: table
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "STG_WD"
+        +tags: "STG_WD"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+
+        
+      WH_1F:
+        +materialized: table
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "WH_1F"
+        +tags: "WH_1F"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+      DATA_QUALITY:
+        +materialized: table
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "DATA_QUALITY"
+        +tags: "DATA_QUALITY"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+
+      MART_TABLES:
+        +materialized: table
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "MART_TABLES"
+        +tags: "MART_TABLES"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+
+
+      MART_RIS:
+        +materialized: view
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "MART_RIS"
+        +tags: "MART_RIS"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+      MART_ELS:
+        +materialized: view
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "MART_ELS"
+        +tags: "MART_ELS"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+
+      MART_TLR:
+        +materialized: view
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "MART_TLR"
+        +tags: "MART_TLR"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+
+      MART_STMJ:
+        +materialized: view
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "MART_STMJ"
+        +tags: "MART_STMJ"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+
+
+      MART_FPAR:
+        +materialized: view
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "MART_FPAR"
+        +tags: "MART_FPAR"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+
+      MART_DNA:
+        +materialized: view
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "MART_DNA"
+        +tags: "MART_DNA"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+      MART_LNP:
+        +materialized: view
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "MART_LNP"
+        +tags: "MART_LNP"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+
+      MART_RELX:
+        +materialized: view
+        +transient: false
+        +database: "{{ env_var('DBT_ANALYTICS_DB') }}"
+        +schema: "MART_RELX"
+        +tags: "MART_RELX"
+        +snowflake_warehouse: "{{ env_var('DBT_WAREHOUSE')}}"
+flags:
+  require_generic_test_arguments_property: true

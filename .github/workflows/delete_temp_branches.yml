@@ -1,0 +1,47 @@
+# Delete temporary merger branch when its PR is merged.
+# Trigger: pull_request.closed (only when PR is merged)
+# Behavior: If PR is merged and the head branch name matches *_to_*_merger_*, delete the remote branch.
+
+name: Delete temporary merger branch
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  delete-temp-branch:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR head branch name and delete if matching pattern
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            const headRef = pr.head.ref;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            core.info(`PR merged. Head branch: ${headRef}`);
+
+            // Pattern: <any>_to_<any>_merger_<timestamp>
+            const pattern = /.+_to_.+_merger_/;
+            if (!pattern.test(headRef)) {
+              core.info('Head branch does not match merger pattern; skipping delete.');
+              return;
+            }
+
+            const ref = `heads/${headRef}`;
+            try {
+              await github.rest.git.deleteRef({
+                owner,
+                repo,
+                ref
+              });
+              core.info(`Deleted remote branch: ${headRef}`);
+            } catch (error) {
+              core.warning(`Failed to delete branch ${headRef}: ${error.message}`);
+            }

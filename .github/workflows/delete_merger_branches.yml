@@ -2,7 +2,7 @@
 # Trigger: pull_request.closed (only when PR is merged)
 # Behavior: If PR is merged and the head branch name matches *_to_*_merger_*, delete the remote branch.
 
-name: Delete temporary merger branch
+name: Delete merger branches
 on:
   pull_request:
     types: [closed]

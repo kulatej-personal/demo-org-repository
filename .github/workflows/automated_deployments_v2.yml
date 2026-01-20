@@ -281,4 +281,3 @@ jobs:
             echo ""
             echo "No differences found between branches or all files were excluded."
           } >> "$GITHUB_STEP_SUMMARY"
-``

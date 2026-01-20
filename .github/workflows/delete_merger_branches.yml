@@ -1,14 +1,17 @@
 # Delete temporary merger branch after the automated deployments workflow finishes.
-# Trigger: workflow_run for "Automated Deployment" (completed)
+# Trigger: workflow_run for "Automated deployments" (completed)
 # Behavior: When the deployments workflow completes successfully, for each associated PR:
 # - If the PR is merged and the head branch name matches *_to_*_merger_*, delete the remote branch.
+
 name: Delete merger branches
 on:
   workflow_run:
     workflows: ["Automated Deployment"]
     types: [completed]
+
 permissions:
   contents: write
+
 jobs:
   delete-temp-branch:
     if: github.event.workflow_run.conclusion == 'success'
@@ -22,33 +25,42 @@ jobs:
             const run = context.payload.workflow_run;
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+
             core.info(`Triggered by workflow: ${run.name}, conclusion: ${run.conclusion}`);
+
             const prs = run.pull_requests || [];
             if (prs.length === 0) {
               core.info('No associated pull requests found; nothing to do.');
               return;
             }
+
             // Pattern: <any>_to_<any>_merger_<timestamp> (or containing "_to_..._merger_")
             const pattern = /.+_to_.+_merger_/;
+
             for (const pr of prs) {
               const prNumber = pr.number;
               core.info(`Processing PR #${prNumber}`);
+
               try {
                 const { data: prData } = await github.rest.pulls.get({
                   owner,
                   repo,
                   pull_number: prNumber
                 });
+
                 if (!prData.merged) {
                   core.info(`PR #${prNumber} is not merged; skipping.`);
                   continue;
                 }
+
                 const headRef = prData.head.ref;
                 core.info(`PR #${prNumber} merged. Head branch: ${headRef}`);
+
                 if (!pattern.test(headRef)) {
                   core.info('Head branch does not match merger pattern; skipping delete.');
                   continue;
                 }
+
                 const ref = `heads/${headRef}`;
                 try {
                   await github.rest.git.deleteRef({

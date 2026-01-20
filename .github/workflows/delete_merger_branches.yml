@@ -5,6 +5,8 @@ on:
     workflows: ["Automated Deployment"]
     types:
       - completed
+  pull_request:
+    types: [closed]
 
 permissions:
   contents: write
@@ -12,12 +14,57 @@ permissions:
 
 jobs:
   delete-temp-branch:
-    # Only run if the Automated Deployment workflow completed successfully
-    if: github.event.workflow_run.conclusion == 'success'
+    # Run if: (1) Automated Deployment succeeded, OR (2) A deployment PR was merged
+    if: |
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'pull_request' && 
+       github.event.pull_request.merged == true && 
+       startsWith(github.event.pull_request.title, 'Deployment Request:') &&
+       contains(github.event.pull_request.head.ref, '_merger_'))
     runs-on: ubuntu-latest
     
     steps:
-      - name: Find and delete merged merger branches
+      - name: Delete merger branch (from PR merge event)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            const headRef = pr.head.ref;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            
+            core.info(`PR merged. Head branch: ${headRef}`);
+            core.info(`PR title: ${pr.title}`);
+            
+            // Pattern: <any>_to_<any>_merger_<timestamp>
+            const pattern = /.+_to_.+_merger_\d{8}_\d{6}$/;
+            
+            if (!pattern.test(headRef)) {
+              core.info('Head branch does not match merger pattern; skipping delete.');
+              return;
+            }
+            
+            const ref = `heads/${headRef}`;
+            
+            try {
+              await github.rest.git.deleteRef({
+                owner,
+                repo,
+                ref
+              });
+              core.info(`✅ Deleted remote branch: ${headRef}`);
+            } catch (error) {
+              if (error.status === 404) {
+                core.info(`Branch ${headRef} already deleted`);
+              } else {
+                core.warning(`Failed to delete branch ${headRef}: ${error.message}`);
+              }
+            }
+      
+      - name: Find and delete merged merger branches (from workflow completion)
+        if: github.event_name == 'workflow_run'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,1 +1,1 @@
-select 20  from dual
+select 20 as val from dual

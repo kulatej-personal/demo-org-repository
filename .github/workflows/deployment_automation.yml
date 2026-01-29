@@ -38,6 +38,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.ref }}  # Check out the branch that triggered the workflow
           fetch-depth: 0
           token: ${{ inputs.github_token }}
 
@@ -66,9 +67,16 @@ jobs:
           git checkout -b "${MERGER_BRANCH}" "origin/${{ inputs.destination_branch }}"
           git push -u origin "${MERGER_BRANCH}"
 
-      - name: Get changed files
+      - name: Get changed files with status
         run: |
           git fetch origin "${{ inputs.source_branch }}"
+          
+          # Get all changed files with their status (A=added, M=modified, D=deleted, etc.)
+          git diff --name-status --diff-filter=ACMR \
+            "origin/${{ inputs.destination_branch }}...origin/${{ inputs.source_branch }}" \
+            > /tmp/all_changed_files_with_status.txt || true
+          
+          # Also save just the file names for backward compatibility
           git diff --name-only --diff-filter=ACMR \
             "origin/${{ inputs.destination_branch }}...origin/${{ inputs.source_branch }}" \
             > /tmp/all_changed_files.txt || true
@@ -86,9 +94,13 @@ jobs:
           IFS=',' read -ra EXCLUDE_ARRAY <<< "$EXCLUDE_FILES"
 
           FILES_TO_DEPLOY=""
-          DEPLOYED_FILES=""
+          DEPLOYED_NEW_FILES=""
+          DEPLOYED_MODIFIED_FILES=""
+          NO_CHANGE_FILES=""
           FAILED_FILES=""
-          DEPLOYED_COUNT=0
+          NEW_COUNT=0
+          MODIFIED_COUNT=0
+          NO_CHANGE_COUNT=0
 
           if [ -z "$FILE_NAMES_INPUT" ]; then
             FILES_TO_DEPLOY="$CHANGED_FILES"
@@ -97,21 +109,57 @@ jobs:
             for input in "${INPUT_FILES[@]}"; do
               input=$(echo "$input" | xargs)
               [ -z "$input" ] && continue
+              
               if echo "$input" | grep -q '\.'; then
                 MATCH=$(echo "$CHANGED_FILES" | grep -Fx "$input" || true)
               else
                 MATCH=$(echo "$CHANGED_FILES" | grep -E "(^|/)${input}\.[a-zA-Z0-9]+$" || true)
               fi
+              
               if [ -n "$MATCH" ]; then
                 FILES_TO_DEPLOY="${FILES_TO_DEPLOY}${MATCH}"$'\n'
               else
-                FAILED_FILES="${FAILED_FILES}- ${input} (no match found)"$'\n'
+                # Check if file exists in both branches (no change case)
+                git fetch origin "${{ inputs.source_branch }}" "${{ inputs.destination_branch }}"
+                
+                # Try to find the file with or without extension
+                if echo "$input" | grep -q '\.'; then
+                  SEARCH_FILE="$input"
+                else
+                  # Search for file with any extension
+                  SEARCH_FILE=$(git ls-tree -r --name-only "origin/${{ inputs.source_branch }}" | grep -E "(^|/)${input}\.[a-zA-Z0-9]+$" | head -1 || true)
+                fi
+                
+                if [ -n "$SEARCH_FILE" ]; then
+                  # Check if file exists in destination branch
+                  if git ls-tree -r --name-only "origin/${{ inputs.destination_branch }}" | grep -Fxq "$SEARCH_FILE"; then
+                    # Compare the files
+                    if git diff --quiet "origin/${{ inputs.destination_branch }}" "origin/${{ inputs.source_branch }}" -- "$SEARCH_FILE" 2>/dev/null; then
+                      NO_CHANGE_FILES="${NO_CHANGE_FILES}- ${SEARCH_FILE} (no changes between branches)"$'\n'
+                      NO_CHANGE_COUNT=$((NO_CHANGE_COUNT + 1))
+                    else
+                      # This shouldn't happen as it should be in changed files, but just in case
+                      FILES_TO_DEPLOY="${FILES_TO_DEPLOY}${SEARCH_FILE}"$'\n'
+                    fi
+                  else
+                    # File doesn't exist in destination (new file)
+                    FILES_TO_DEPLOY="${FILES_TO_DEPLOY}${SEARCH_FILE}"$'\n'
+                  fi
+                else
+                  FAILED_FILES="${FAILED_FILES}- ${input} (file not found in source branch)"$'\n'
+                fi
               fi
             done
           fi
 
           echo "$FILES_TO_DEPLOY" | sort -u > /tmp/files_to_deploy.txt
           git fetch origin "${{ inputs.source_branch }}"
+
+          # Read the status file to categorize files as new or modified
+          declare -A FILE_STATUS_MAP
+          while IFS=$'\t' read -r status file; do
+            FILE_STATUS_MAP["$file"]="$status"
+          done < /tmp/all_changed_files_with_status.txt
 
           while IFS= read -r file; do
             [ -z "$file" ] && continue
@@ -123,13 +171,28 @@ jobs:
 
             git checkout "origin/${{ inputs.source_branch }}" -- "$file"
             git add "$file"
-            DEPLOYED_FILES="${DEPLOYED_FILES}- ${file}"$'\n'
-            DEPLOYED_COUNT=$((DEPLOYED_COUNT + 1))
+            
+            # Categorize the file based on its status
+            STATUS="${FILE_STATUS_MAP[$file]}"
+            if [ "$STATUS" = "A" ]; then
+              DEPLOYED_NEW_FILES="${DEPLOYED_NEW_FILES}- ${file}"$'\n'
+              NEW_COUNT=$((NEW_COUNT + 1))
+            else
+              DEPLOYED_MODIFIED_FILES="${DEPLOYED_MODIFIED_FILES}- ${file}"$'\n'
+              MODIFIED_COUNT=$((MODIFIED_COUNT + 1))
+            fi
           done < /tmp/files_to_deploy.txt
 
-          echo "$DEPLOYED_FILES" > /tmp/deployed_files.txt
+          echo "$DEPLOYED_NEW_FILES" > /tmp/deployed_new_files.txt
+          echo "$DEPLOYED_MODIFIED_FILES" > /tmp/deployed_modified_files.txt
+          echo "$NO_CHANGE_FILES" > /tmp/no_change_files.txt
           echo "$FAILED_FILES" > /tmp/failed_files.txt
-          echo "$DEPLOYED_COUNT" > /tmp/deployed_count.txt
+          echo "$NEW_COUNT" > /tmp/new_count.txt
+          echo "$MODIFIED_COUNT" > /tmp/modified_count.txt
+          echo "$NO_CHANGE_COUNT" > /tmp/no_change_count.txt
+
+          TOTAL_DEPLOYED=$((NEW_COUNT + MODIFIED_COUNT))
+          echo "$TOTAL_DEPLOYED" > /tmp/deployed_count.txt
 
           if [ -n "$(git status --porcelain)" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
@@ -140,10 +203,10 @@ jobs:
       - name: Commit changes
         if: steps.cherry_pick.outputs.has_changes == 'true'
         run: |
-          git commit -m "Automated deployment"
+          git commit -m "Automated deployment from ${{ inputs.source_branch }} to ${{ inputs.destination_branch }}"
           git push origin "${{ steps.create_branch.outputs.merger_branch }}"
 
-      - name: Create Pull Request (safe:pass values via env)
+      - name: Create Pull Request
         if: steps.cherry_pick.outputs.has_changes == 'true'
         uses: actions/github-script@v7
         id: create_pr
@@ -158,9 +221,14 @@ jobs:
           github-token: ${{ inputs.github_token }}
           script: |
             const fs = require('fs');
-            const deployedFiles = fs.existsSync('/tmp/deployed_files.txt') ? fs.readFileSync('/tmp/deployed_files.txt','utf8') : '';
+            const deployedNewFiles = fs.existsSync('/tmp/deployed_new_files.txt') ? fs.readFileSync('/tmp/deployed_new_files.txt','utf8') : '';
+            const deployedModifiedFiles = fs.existsSync('/tmp/deployed_modified_files.txt') ? fs.readFileSync('/tmp/deployed_modified_files.txt','utf8') : '';
+            const noChangeFiles = fs.existsSync('/tmp/no_change_files.txt') ? fs.readFileSync('/tmp/no_change_files.txt','utf8') : '';
             const failedFiles = fs.existsSync('/tmp/failed_files.txt') ? fs.readFileSync('/tmp/failed_files.txt','utf8') : '';
             const allChanges = fs.existsSync('/tmp/all_changed_files.txt') ? fs.readFileSync('/tmp/all_changed_files.txt','utf8') : '';
+            const newCount = fs.existsSync('/tmp/new_count.txt') ? fs.readFileSync('/tmp/new_count.txt','utf8').trim() : '0';
+            const modifiedCount = fs.existsSync('/tmp/modified_count.txt') ? fs.readFileSync('/tmp/modified_count.txt','utf8').trim() : '0';
+            const noChangeCount = fs.existsSync('/tmp/no_change_count.txt') ? fs.readFileSync('/tmp/no_change_count.txt','utf8').trim() : '0';
             const deployedCount = fs.existsSync('/tmp/deployed_count.txt') ? fs.readFileSync('/tmp/deployed_count.txt','utf8').trim() : '0';
             const filesList = allChanges.split('\n').filter(f => f.trim());
 
@@ -179,18 +247,41 @@ jobs:
             if (!fileNames) {
               bodyText += `**Mode:** Full deployment (all changes)\n`;
               bodyText += `**Total changes in source:** ${filesList.length} files\n`;
-              bodyText += `**Successfully deployed:** ${deployedCount} files\n\n`;
             } else {
               bodyText += `**Mode:** Selective deployment\n`;
-              bodyText += `**Successfully deployed:** ${deployedCount} files\n\n`;
+            }
+            
+            bodyText += `**✅ Successfully deployed:** ${deployedCount} files (${newCount} new, ${modifiedCount} modified)\n`;
+            
+            if (parseInt(noChangeCount) > 0) {
+              bodyText += `**ℹ️ No changes:** ${noChangeCount} files\n`;
+            }
+            
+            if (failedFiles.trim()) {
+              const failedCount = failedFiles.split('\n').filter(f => f.trim()).length;
+              bodyText += `**❌ Failed:** ${failedCount} files\n`;
+            }
+            
+            bodyText += '\n';
+
+            if (deployedNewFiles.trim()) {
+              bodyText += '### ✨ New Files Deployed\n';
+              bodyText += '```\n' + deployedNewFiles + '```\n\n';
             }
 
-            bodyText += '### ✅ Successfully Deployed Files\n';
-            bodyText += '```\n' + (deployedFiles || 'None') + '\n```\n\n';
+            if (deployedModifiedFiles.trim()) {
+              bodyText += '### 📝 Modified Files Deployed\n';
+              bodyText += '```\n' + deployedModifiedFiles + '```\n\n';
+            }
+
+            if (noChangeFiles.trim()) {
+              bodyText += '### ℹ️ Files with No Changes\n';
+              bodyText += '```\n' + noChangeFiles + '```\n\n';
+            }
 
             if (failedFiles.trim()) {
-              bodyText += '### ⚠️ Failed Files\n';
-              bodyText += '```\n' + failedFiles + '\n```\n\n';
+              bodyText += '### ⚠️ Failed/Not Found Files\n';
+              bodyText += '```\n' + failedFiles + '```\n\n';
             }
 
             bodyText += '### 🔒 Excluded Files (Auto-restored from destination if present)\n';
@@ -213,7 +304,7 @@ jobs:
             const pr = await github.rest.pulls.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `Deployment Request: ${src} → ${dst}`,
+              title: `Deployment: ${src} → ${dst}`,
               head: headBranch,
               base: dst,
               body: bodyText
@@ -250,10 +341,25 @@ jobs:
       - name: Summary
         if: steps.cherry_pick.outputs.has_changes == 'true'
         run: |
+          NEW_COUNT=$(cat /tmp/new_count.txt)
+          MODIFIED_COUNT=$(cat /tmp/modified_count.txt)
+          NO_CHANGE_COUNT=$(cat /tmp/no_change_count.txt)
+          DEPLOYED_COUNT=$(cat /tmp/deployed_count.txt)
+          
           echo "## ✅ Deployment PR Created Successfully" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**PR Number:** ${{ steps.create_pr.outputs.result }}" >> "$GITHUB_STEP_SUMMARY"
           echo "**Merger Branch:** \`${{ steps.create_branch.outputs.merger_branch }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Deployment Statistics:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ✅ **Successfully Deployed:** ${DEPLOYED_COUNT} files" >> "$GITHUB_STEP_SUMMARY"
+          echo "  - ✨ New files: ${NEW_COUNT}" >> "$GITHUB_STEP_SUMMARY"
+          echo "  - 📝 Modified files: ${MODIFIED_COUNT}" >> "$GITHUB_STEP_SUMMARY"
+          
+          if [ "$NO_CHANGE_COUNT" != "0" ]; then
+            echo "- ℹ️ **No Changes:** ${NO_CHANGE_COUNT} files" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "### Next Steps:" >> "$GITHUB_STEP_SUMMARY"
           echo "1. Review the PR at the link above" >> "$GITHUB_STEP_SUMMARY"

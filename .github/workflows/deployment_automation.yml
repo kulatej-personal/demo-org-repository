@@ -73,23 +73,8 @@ jobs:
           git checkout "${{ inputs.destination_branch }}"
           echo "✅ Now on destination branch context"
 
-      - name: Create merger branch
-        id: create_branch
-        run: |
-          set -e
-          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          SRC=$(echo "${{ inputs.source_branch }}" | tr '[:upper:]' '[:lower:]' | sed 's/[\/ ]/_/g')
-          DST=$(echo "${{ inputs.destination_branch }}" | tr '[:upper:]' '[:lower:]' | sed 's/[\/ ]/_/g')
-          MERGER_BRANCH="${SRC}_to_${DST}_merger_${TIMESTAMP}"
-          echo "merger_branch=${MERGER_BRANCH}" >> "$GITHUB_OUTPUT"
-          echo "Creating merger branch: ${MERGER_BRANCH}"
-
-          git fetch origin "${{ inputs.destination_branch }}"
-          git checkout -b "${MERGER_BRANCH}" "origin/${{ inputs.destination_branch }}"
-          git push -u origin "${MERGER_BRANCH}"
-          echo "✅ Merger branch created and pushed"
-
       - name: Get changed files with status
+        id: check_changes
         run: |
           git fetch origin "${{ inputs.source_branch }}"
           
@@ -106,13 +91,20 @@ jobs:
           
           CHANGE_COUNT=$(wc -l < /tmp/all_changed_files.txt | xargs)
           echo "Found ${CHANGE_COUNT} changed files"
+          
+          # Check if there are any changes
+          if [ "$CHANGE_COUNT" -eq 0 ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ No changes detected between branches"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Changes detected, proceeding with deployment"
+          fi
 
-      - name: Cherry-pick / Checkout files
-        id: cherry_pick
+      - name: Analyze files to deploy
+        id: analyze_files
+        if: steps.check_changes.outputs.has_changes == 'true'
         run: |
-          set -e
-          git checkout "${{ steps.create_branch.outputs.merger_branch }}"
-
           FILE_NAMES_INPUT="${{ inputs.file_names }}"
           EXCLUDE_FILES="${{ inputs.exclude_files }}"
           CHANGED_FILES=$(cat /tmp/all_changed_files.txt || true)
@@ -120,12 +112,8 @@ jobs:
           IFS=',' read -ra EXCLUDE_ARRAY <<< "$EXCLUDE_FILES"
 
           FILES_TO_DEPLOY=""
-          DEPLOYED_NEW_FILES=""
-          DEPLOYED_MODIFIED_FILES=""
           NO_CHANGE_FILES=""
           FAILED_FILES=""
-          NEW_COUNT=0
-          MODIFIED_COUNT=0
           NO_CHANGE_COUNT=0
 
           if [ -z "$FILE_NAMES_INPUT" ]; then
@@ -180,7 +168,68 @@ jobs:
             done
           fi
 
-          echo "$FILES_TO_DEPLOY" | sort -u > /tmp/files_to_deploy.txt
+          # Remove excluded files from deployment
+          FILTERED_FILES=""
+          echo "$FILES_TO_DEPLOY" | sort -u > /tmp/files_to_deploy_temp.txt
+          
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            SKIP=false
+            for ex in "${EXCLUDE_ARRAY[@]}"; do
+              echo "$file" | grep -Fq "$ex" && SKIP=true
+            done
+            if [ "$SKIP" = false ]; then
+              FILTERED_FILES="${FILTERED_FILES}${file}"$'\n'
+            fi
+          done < /tmp/files_to_deploy_temp.txt
+
+          echo "$FILTERED_FILES" | grep -v '^$' > /tmp/files_to_deploy.txt || true
+          echo "$NO_CHANGE_FILES" > /tmp/no_change_files.txt
+          echo "$FAILED_FILES" > /tmp/failed_files.txt
+          echo "$NO_CHANGE_COUNT" > /tmp/no_change_count.txt
+
+          DEPLOY_COUNT=$(cat /tmp/files_to_deploy.txt | grep -c '^' || echo "0")
+          
+          echo "Files to deploy: ${DEPLOY_COUNT}"
+          echo "No change files: ${NO_CHANGE_COUNT}"
+          
+          if [ "$DEPLOY_COUNT" -eq 0 ]; then
+            echo "has_files_to_deploy=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ No files to deploy after filtering"
+          else
+            echo "has_files_to_deploy=true" >> "$GITHUB_OUTPUT"
+            echo "✅ ${DEPLOY_COUNT} files ready to deploy"
+          fi
+
+      - name: Create merger branch
+        id: create_branch
+        if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
+        run: |
+          set -e
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          SRC=$(echo "${{ inputs.source_branch }}" | tr '[:upper:]' '[:lower:]' | sed 's/[\/ ]/_/g')
+          DST=$(echo "${{ inputs.destination_branch }}" | tr '[:upper:]' '[:lower:]' | sed 's/[\/ ]/_/g')
+          MERGER_BRANCH="${SRC}_to_${DST}_merger_${TIMESTAMP}"
+          echo "merger_branch=${MERGER_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "Creating merger branch: ${MERGER_BRANCH}"
+
+          git fetch origin "${{ inputs.destination_branch }}"
+          git checkout -b "${MERGER_BRANCH}" "origin/${{ inputs.destination_branch }}"
+          git push -u origin "${MERGER_BRANCH}"
+          echo "✅ Merger branch created and pushed"
+
+      - name: Deploy files to merger branch
+        id: cherry_pick
+        if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
+        run: |
+          set -e
+          git checkout "${{ steps.create_branch.outputs.merger_branch }}"
+
+          DEPLOYED_NEW_FILES=""
+          DEPLOYED_MODIFIED_FILES=""
+          NEW_COUNT=0
+          MODIFIED_COUNT=0
+
           git fetch origin "${{ inputs.source_branch }}"
 
           # Read the status file to categorize files as new or modified
@@ -192,14 +241,6 @@ jobs:
           echo "Processing files for deployment..."
           while IFS= read -r file; do
             [ -z "$file" ] && continue
-            SKIP=false
-            for ex in "${EXCLUDE_ARRAY[@]}"; do
-              echo "$file" | grep -Fq "$ex" && SKIP=true
-            done
-            if [ "$SKIP" = true ]; then
-              echo "  Skipping excluded file: $file"
-              continue
-            fi
 
             echo "  Deploying: $file"
             git checkout "origin/${{ inputs.source_branch }}" -- "$file"
@@ -218,11 +259,8 @@ jobs:
 
           echo "$DEPLOYED_NEW_FILES" > /tmp/deployed_new_files.txt
           echo "$DEPLOYED_MODIFIED_FILES" > /tmp/deployed_modified_files.txt
-          echo "$NO_CHANGE_FILES" > /tmp/no_change_files.txt
-          echo "$FAILED_FILES" > /tmp/failed_files.txt
           echo "$NEW_COUNT" > /tmp/new_count.txt
           echo "$MODIFIED_COUNT" > /tmp/modified_count.txt
-          echo "$NO_CHANGE_COUNT" > /tmp/no_change_count.txt
 
           TOTAL_DEPLOYED=$((NEW_COUNT + MODIFIED_COUNT))
           echo "$TOTAL_DEPLOYED" > /tmp/deployed_count.txt
@@ -233,22 +271,20 @@ jobs:
           echo "  Total deployed: ${TOTAL_DEPLOYED}"
 
           if [ -n "$(git status --porcelain)" ]; then
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-            echo "✅ Changes detected and staged"
+            echo "✅ Changes staged successfully"
           else
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            echo "ℹ️ No changes to deploy"
+            echo "⚠️ No changes staged (unexpected)"
           fi
 
       - name: Commit changes
-        if: steps.cherry_pick.outputs.has_changes == 'true'
+        if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
         run: |
           git commit -m "Automated deployment from ${{ inputs.source_branch }} to ${{ inputs.destination_branch }}"
           git push origin "${{ steps.create_branch.outputs.merger_branch }}"
           echo "✅ Changes committed and pushed"
 
       - name: Create Pull Request
-        if: steps.cherry_pick.outputs.has_changes == 'true'
+        if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
         uses: actions/github-script@v7
         id: create_pr
         env:
@@ -357,7 +393,7 @@ jobs:
             return pr.data.number;
 
       - name: Add labels to PR
-        if: steps.cherry_pick.outputs.has_changes == 'true'
+        if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
         uses: actions/github-script@v7
         env:
           GITHUB_TOKEN: ${{ inputs.github_token }}
@@ -382,8 +418,8 @@ jobs:
               console.log('Could not add labels (they may not exist):', error.message);
             }
 
-      - name: Summary
-        if: steps.cherry_pick.outputs.has_changes == 'true'
+      - name: Summary - Success
+        if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
         run: |
           NEW_COUNT=$(cat /tmp/new_count.txt)
           MODIFIED_COUNT=$(cat /tmp/modified_count.txt)
@@ -411,9 +447,34 @@ jobs:
           echo "3. Merge after approval" >> "$GITHUB_STEP_SUMMARY"
           echo "4. **Manually run your dbt jobs after merge**" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: No changes summary
-        if: steps.cherry_pick.outputs.has_changes == 'false'
+      - name: Summary - No Changes
+        if: steps.check_changes.outputs.has_changes == 'false' || steps.analyze_files.outputs.has_files_to_deploy == 'false'
         run: |
           echo "## ℹ️ No Changes to Deploy" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "No differences found between branches or all files were excluded." >> "$GITHUB_STEP_SUMMARY"
+          
+          if [ "${{ steps.check_changes.outputs.has_changes }}" == "false" ]; then
+            echo "**Reason:** No differences found between \`${{ inputs.source_branch }}\` and \`${{ inputs.destination_branch }}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "**Reason:** All files were either excluded or had no changes" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "No merger branch was created." >> "$GITHUB_STEP_SUMMARY"
+          
+          # Show details if files were specified but had no changes
+          if [ -f /tmp/no_change_files.txt ] && [ -s /tmp/no_change_files.txt ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Files with No Changes:" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/no_change_files.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          
+          if [ -f /tmp/failed_files.txt ] && [ -s /tmp/failed_files.txt ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Files Not Found:" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/failed_files.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi

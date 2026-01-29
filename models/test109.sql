@@ -1,1 +1,1 @@
-select 99 from dual
+select 9999 from dual

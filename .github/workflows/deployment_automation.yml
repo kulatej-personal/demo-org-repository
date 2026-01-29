@@ -38,7 +38,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.destination_branch }}  # Checkout destination branch instead of github.ref
           fetch-depth: 0
           token: ${{ inputs.github_token }}
 
@@ -50,8 +49,26 @@ jobs:
       - name: Validate branches exist
         run: |
           set -e
-          git ls-remote --heads origin "${{ inputs.source_branch }}" | grep -q refs/heads
-          git ls-remote --heads origin "${{ inputs.destination_branch }}" | grep -q refs/heads
+          echo "Validating source branch: ${{ inputs.source_branch }}"
+          git ls-remote --heads origin "${{ inputs.source_branch }}" | grep -q refs/heads || {
+            echo "Error: Source branch '${{ inputs.source_branch }}' does not exist"
+            exit 1
+          }
+          
+          echo "Validating destination branch: ${{ inputs.destination_branch }}"
+          git ls-remote --heads origin "${{ inputs.destination_branch }}" | grep -q refs/heads || {
+            echo "Error: Destination branch '${{ inputs.destination_branch }}' does not exist"
+            exit 1
+          }
+          
+          echo "✅ Both branches validated successfully"
+
+      - name: Setup destination branch context
+        run: |
+          echo "Fetching destination branch: ${{ inputs.destination_branch }}"
+          git fetch origin "${{ inputs.destination_branch }}"
+          git checkout "${{ inputs.destination_branch }}"
+          echo "✅ Now on destination branch context"
 
       - name: Create merger branch
         id: create_branch
@@ -62,15 +79,18 @@ jobs:
           DST=$(echo "${{ inputs.destination_branch }}" | tr '[:upper:]' '[:lower:]' | sed 's/[\/ ]/_/g')
           MERGER_BRANCH="${SRC}_to_${DST}_merger_${TIMESTAMP}"
           echo "merger_branch=${MERGER_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "Creating merger branch: ${MERGER_BRANCH}"
 
           git fetch origin "${{ inputs.destination_branch }}"
           git checkout -b "${MERGER_BRANCH}" "origin/${{ inputs.destination_branch }}"
           git push -u origin "${MERGER_BRANCH}"
+          echo "✅ Merger branch created and pushed"
 
       - name: Get changed files with status
         run: |
           git fetch origin "${{ inputs.source_branch }}"
           
+          echo "Getting changed files between branches..."
           # Get all changed files with their status (A=added, M=modified, D=deleted, etc.)
           git diff --name-status --diff-filter=ACMR \
             "origin/${{ inputs.destination_branch }}...origin/${{ inputs.source_branch }}" \
@@ -80,6 +100,9 @@ jobs:
           git diff --name-only --diff-filter=ACMR \
             "origin/${{ inputs.destination_branch }}...origin/${{ inputs.source_branch }}" \
             > /tmp/all_changed_files.txt || true
+          
+          CHANGE_COUNT=$(wc -l < /tmp/all_changed_files.txt | xargs)
+          echo "Found ${CHANGE_COUNT} changed files"
 
       - name: Cherry-pick / Checkout files
         id: cherry_pick
@@ -103,8 +126,10 @@ jobs:
           NO_CHANGE_COUNT=0
 
           if [ -z "$FILE_NAMES_INPUT" ]; then
+            echo "Mode: Full deployment (all changed files)"
             FILES_TO_DEPLOY="$CHANGED_FILES"
           else
+            echo "Mode: Selective deployment"
             IFS=',' read -ra INPUT_FILES <<< "$FILE_NAMES_INPUT"
             for input in "${INPUT_FILES[@]}"; do
               input=$(echo "$input" | xargs)
@@ -161,14 +186,19 @@ jobs:
             FILE_STATUS_MAP["$file"]="$status"
           done < /tmp/all_changed_files_with_status.txt
 
+          echo "Processing files for deployment..."
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             SKIP=false
             for ex in "${EXCLUDE_ARRAY[@]}"; do
               echo "$file" | grep -Fq "$ex" && SKIP=true
             done
-            [ "$SKIP" = true ] && continue
+            if [ "$SKIP" = true ]; then
+              echo "  Skipping excluded file: $file"
+              continue
+            fi
 
+            echo "  Deploying: $file"
             git checkout "origin/${{ inputs.source_branch }}" -- "$file"
             git add "$file"
             
@@ -194,10 +224,17 @@ jobs:
           TOTAL_DEPLOYED=$((NEW_COUNT + MODIFIED_COUNT))
           echo "$TOTAL_DEPLOYED" > /tmp/deployed_count.txt
 
+          echo "Deployment summary:"
+          echo "  New files: ${NEW_COUNT}"
+          echo "  Modified files: ${MODIFIED_COUNT}"
+          echo "  Total deployed: ${TOTAL_DEPLOYED}"
+
           if [ -n "$(git status --porcelain)" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Changes detected and staged"
           else
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ No changes to deploy"
           fi
 
       - name: Commit changes
@@ -205,6 +242,7 @@ jobs:
         run: |
           git commit -m "Automated deployment from ${{ inputs.source_branch }} to ${{ inputs.destination_branch }}"
           git push origin "${{ steps.create_branch.outputs.merger_branch }}"
+          echo "✅ Changes committed and pushed"
 
       - name: Create Pull Request
         if: steps.cherry_pick.outputs.has_changes == 'true'

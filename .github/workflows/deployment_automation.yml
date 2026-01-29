@@ -38,7 +38,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}  # Check out the branch that triggered the workflow
+          ref: ${{ inputs.destination_branch }}  # Checkout destination branch instead of github.ref
           fetch-depth: 0
           token: ${{ inputs.github_token }}
 
@@ -310,6 +310,9 @@ jobs:
               body: bodyText
             });
 
+            core.info(`✅ Pull Request #${pr.data.number} created successfully`);
+            core.info(`🔗 PR URL: ${pr.data.html_url}`);
+            
             return pr.data.number;
 
       - name: Add labels to PR

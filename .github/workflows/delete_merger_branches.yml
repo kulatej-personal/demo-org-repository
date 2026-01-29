@@ -1,12 +1,14 @@
 # Delete temporary merger branch when its PR is merged.
-# Trigger: pull_request.closed (only when PR is merged)
+# Trigger: pull_request.closed (only when PR is merged to specific branches)
 # Behavior: 
-#   1. Verify the PR was created by the automated deployment workflow
-#   2. Check if the head branch matches the merger pattern (*_to_*_merger_*)
-#   3. Delete the remote branch only if all checks pass
+#   1. Verify the PR base branch matches one of the monitored branches
+#   2. Verify the PR was created by the automated deployment workflow
+#   3. Check if the head branch matches the merger pattern (*_to_*_merger_*)
+#   4. Delete the remote branch only if all checks pass
 #
 # Safety features:
 #   - Only deletes branches created by automated deployment
+#   - Only triggers for PRs merged to specific base branches
 #   - Verifies branch naming pattern
 #   - Checks for deployment labels
 #   - Logs all actions for audit trail
@@ -16,10 +18,16 @@ name: Delete Merger Branches latest
 on:
   pull_request:
     types: [closed]
+    branches:
+      - dev-release      # Add your monitored branches here
+      - staging
+      - production
+      - main
+      # Add any other branches where automated deployments target
 
 permissions:
   contents: write
-  pull-requests: read
+  pull-requests: write
 
 jobs:
   delete-temp-branch:
@@ -34,6 +42,7 @@ jobs:
           script: |
             const pr = context.payload.pull_request;
             const headRef = pr.head.ref;
+            const baseRef = pr.base.ref;
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const prNumber = pr.number;
@@ -42,6 +51,7 @@ jobs:
             
             core.info(`🔍 Checking PR #${prNumber}: ${prTitle}`);
             core.info(`📋 Head branch: ${headRef}`);
+            core.info(`🎯 Base branch: ${baseRef}`);
             core.info(`🏷️  Labels: ${prLabels.join(', ') || 'none'}`);
             
             // Check 1: Verify branch naming pattern
@@ -108,14 +118,15 @@ jobs:
               
               core.info(`🗑️  Successfully deleted remote branch: ${headRef}`);
               core.info(`✨ Cleanup completed for PR #${prNumber}`);
+              core.info(`📍 Base branch was: ${baseRef}`);
               
-              // Optional: Add a comment to the PR confirming cleanup
+              // Add a comment to the PR confirming cleanup
               try {
                 await github.rest.issues.createComment({
                   owner,
                   repo,
                   issue_number: prNumber,
-                  body: `🤖 **Automated Cleanup**\n\nTemporary merger branch \`${headRef}\` has been automatically deleted after merge.`
+                  body: `🤖 **Automated Cleanup**\n\nTemporary merger branch \`${headRef}\` has been automatically deleted after merge to \`${baseRef}\`.`
                 });
               } catch (commentError) {
                 core.warning('Could not add cleanup comment to PR');
@@ -124,7 +135,7 @@ jobs:
             } catch (error) {
               core.error(`❌ Failed to delete branch ${headRef}: ${error.message}`);
               
-              // Optional: Add a comment about the failure
+              // Add a comment about the failure
               try {
                 await github.rest.issues.createComment({
                   owner,
@@ -146,6 +157,7 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**PR Number:** #${{ github.event.pull_request.number }}" >> "$GITHUB_STEP_SUMMARY"
           echo "**Branch Deleted:** \`${{ github.event.pull_request.head.ref }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Base Branch:** \`${{ github.event.pull_request.base.ref }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "**PR Title:** ${{ github.event.pull_request.title }}" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "The temporary merger branch has been automatically cleaned up." >> "$GITHUB_STEP_SUMMARY"
@@ -157,5 +169,6 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**PR Number:** #${{ github.event.pull_request.number }}" >> "$GITHUB_STEP_SUMMARY"
           echo "**Branch:** \`${{ github.event.pull_request.head.ref }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Base Branch:** \`${{ github.event.pull_request.base.ref }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Please check the logs and consider deleting the branch manually if needed." >> "$GITHUB_STEP_SUMMARY"

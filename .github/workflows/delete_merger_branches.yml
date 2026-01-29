@@ -18,12 +18,6 @@ name: Delete Merger Branches latest
 on:
   pull_request:
     types: [closed]
-    branches:
-      - dev-release      # Add your monitored branches here
-      - staging
-      - production
-      - main
-      # Add any other branches where automated deployments target
 
 permissions:
   contents: write

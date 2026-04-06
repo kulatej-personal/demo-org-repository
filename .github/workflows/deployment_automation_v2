@@ -1,0 +1,671 @@
+name: Automated Deployment
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SNOWFLAKE SECRETS — set these once in your repo:
+#   Settings → Secrets and variables → Actions → New repository secret
+#
+#   SNOWFLAKE_ACCOUNT   e.g. xy12345.us-east-1
+#   SNOWFLAKE_USER      e.g. my_service_user
+#   SNOWFLAKE_PASSWORD  e.g. ••••••••
+#   SNOWFLAKE_DATABASE  e.g. ANALYTICS
+#   SNOWFLAKE_SCHEMA    e.g. DBT_AUDIT
+#   SNOWFLAKE_WAREHOUSE e.g. COMPUTE_WH
+#
+# The workflow will query audit_model_lineage and resolve all dbt dependencies
+# (mart_tables, wh_1f, stg-tables, seed_names, source_pvo) for the mart_views
+# you pass in file_names. Only changed files among those dependencies are deployed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: 'Source branch to deploy from'
+        required: true
+        type: string
+      destination_branch:
+        description: 'Destination branch to deploy to'
+        required: true
+        type: string
+      github_token:
+        description: 'GitHub Personal Access Token (PAT)'
+        required: true
+        type: string
+      file_names:
+        description: 'Comma-separated mart_views to resolve dependencies for (extension optional). Leave empty for full deployment.'
+        required: false
+        type: string
+      exclude_files:
+        description: 'Files to exclude'
+        required: false
+        type: string
+        default: 'source.yml,relx_fivetran_connector_mapping.csv'
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  create-deployment-pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure Git with Token
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+          git config --global url."https://x-access-token:${{ inputs.github_token }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Validate branches exist
+        run: |
+          set -e
+          echo "Validating source branch: ${{ inputs.source_branch }}"
+          git ls-remote --heads origin "${{ inputs.source_branch }}" | grep -q refs/heads || {
+            echo "Error: Source branch '${{ inputs.source_branch }}' does not exist"
+            exit 1
+          }
+
+          echo "Validating destination branch: ${{ inputs.destination_branch }}"
+          git ls-remote --heads origin "${{ inputs.destination_branch }}" | grep -q refs/heads || {
+            echo "Error: Destination branch '${{ inputs.destination_branch }}' does not exist"
+            exit 1
+          }
+
+          echo "✅ Both branches validated successfully"
+
+      - name: Setup destination branch context
+        run: |
+          echo "Fetching destination branch: ${{ inputs.destination_branch }}"
+          git fetch origin "${{ inputs.destination_branch }}"
+          git checkout "${{ inputs.destination_branch }}"
+          echo "✅ Now on destination branch context"
+
+      # ───────────────────────────────────────────────────────────────────────
+      # SNOWFLAKE DEPENDENCY RESOLUTION
+      # Runs only when file_names is provided (selective deployment mode).
+      # Queries audit_model_lineage to expand mart_views → all dbt model names.
+      # Credentials are read from GitHub repository secrets (never visible in UI).
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Fetch dependencies from Snowflake
+        id: snowflake_deps
+        if: inputs.file_names != ''
+        env:
+          FILE_NAMES:          ${{ inputs.file_names }}
+          SNOWFLAKE_ACCOUNT:   ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER:      ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD:  ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_DATABASE:  ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA:    ${{ secrets.SNOWFLAKE_SCHEMA }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+        run: |
+          echo "Installing Snowflake connector..."
+          pip install snowflake-connector-python --quiet
+
+          python3 << 'PYEOF'
+          import snowflake.connector
+          import os
+          import sys
+
+          file_names = os.environ.get('FILE_NAMES', '').strip()
+          views      = [v.strip() for v in file_names.split(',') if v.strip()]
+
+          if not views:
+              print("No views provided — skipping Snowflake lookup")
+              sys.exit(0)
+
+          print(f"Querying audit_model_lineage for {len(views)} mart_view(s): {views}")
+
+          try:
+              conn = snowflake.connector.connect(
+                  account   = os.environ['SNOWFLAKE_ACCOUNT'],
+                  user      = os.environ['SNOWFLAKE_USER'],
+                  password  = os.environ['SNOWFLAKE_PASSWORD'],
+                  database  = os.environ['SNOWFLAKE_DATABASE'],
+                  schema    = os.environ['SNOWFLAKE_SCHEMA'],
+                  warehouse = os.environ['SNOWFLAKE_WAREHOUSE'],
+              )
+          except Exception as e:
+              print(f"❌ Snowflake connection failed: {e}")
+              sys.exit(1)
+
+          placeholders = ','.join(['%s'] * len(views))
+
+          # stg-tables has a hyphen so must be double-quoted in Snowflake SQL
+          query = f"""
+              SELECT
+                  mart_views,
+                  mart_tables,
+                  wh_1f,
+                  "stg-tables",
+                  seed_names,
+                  source_pvo
+              FROM audit_model_lineage
+              WHERE mart_views IN ({placeholders})
+          """
+
+          try:
+              cur = conn.cursor()
+              cur.execute(query, views)
+              rows = cur.fetchall()
+          except Exception as e:
+              print(f"❌ Query failed: {e}")
+              conn.close()
+              sys.exit(1)
+
+          conn.close()
+
+          if not rows:
+              print("⚠️  No rows returned from audit_model_lineage for the given views.")
+              print("Falling back to the original file_names as-is.")
+              with open('/tmp/resolved_file_names.txt', 'w') as f:
+                  f.write(file_names)
+              with open('/tmp/snowflake_deps_summary.txt', 'w') as f:
+                  f.write("No matching rows found in audit_model_lineage.\n")
+              sys.exit(0)
+
+          # Columns: mart_views(0) mart_tables(1) wh_1f(2) stg-tables(3) seed_names(4) source_pvo(5)
+          COLUMN_LABELS = [
+              ('mart_tables', 1),
+              ('wh_1f',       2),
+              ('stg-tables',  3),
+              ('seed_names',  4),
+              ('source_pvo',  5),
+          ]
+
+          all_deps      = set()   # flat set of every dbt model name found
+          not_found     = []      # views the user passed but weren't in the table
+          summary_lines = []
+
+          found_views = {row[0] for row in rows}
+          for v in views:
+              if v not in found_views:
+                  not_found.append(v)
+
+          for row in rows:
+              view     = row[0]
+              per_view = {}
+              for label, idx in COLUMN_LABELS:
+                  val = row[idx]
+                  if val and str(val).strip():
+                      model_name = str(val).strip()
+                      all_deps.add(model_name)
+                      per_view[label] = model_name
+
+              summary_lines.append(f"mart_view : {view}")
+              for label, idx in COLUMN_LABELS:
+                  dep_val = per_view.get(label, '(none)')
+                  summary_lines.append(f"  {label:<14}: {dep_val}")
+              summary_lines.append("")
+
+          if not_found:
+              summary_lines.append("Views not found in audit_model_lineage:")
+              for v in not_found:
+                  summary_lines.append(f"  ⚠️  {v}")
+
+          with open('/tmp/resolved_file_names.txt', 'w') as f:
+              f.write(','.join(sorted(all_deps)))
+
+          with open('/tmp/snowflake_deps_summary.txt', 'w') as f:
+              f.write('\n'.join(summary_lines))
+
+          print(f"✅ Resolved {len(all_deps)} dbt model(s) across {len(rows)} view(s)")
+          print("Models to deploy:", sorted(all_deps))
+          PYEOF
+
+      - name: Get changed files with status
+        id: check_changes
+        run: |
+          git fetch origin "${{ inputs.source_branch }}"
+
+          echo "Getting changed files between branches..."
+          git diff --name-status --diff-filter=ACMR \
+            "origin/${{ inputs.destination_branch }}...origin/${{ inputs.source_branch }}" \
+            > /tmp/all_changed_files_with_status.txt || true
+
+          git diff --name-only --diff-filter=ACMR \
+            "origin/${{ inputs.destination_branch }}...origin/${{ inputs.source_branch }}" \
+            > /tmp/all_changed_files.txt || true
+
+          CHANGE_COUNT=$(wc -l < /tmp/all_changed_files.txt | xargs)
+          echo "Found ${CHANGE_COUNT} changed files"
+
+          if [ "$CHANGE_COUNT" -eq 0 ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ No changes detected between branches"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Changes detected, proceeding with deployment"
+          fi
+
+      - name: Analyze files to deploy
+        id: analyze_files
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          # ── Resolve which file list to use ────────────────────────────────
+          # If Snowflake resolved dependencies, use those; otherwise fall back
+          # to the raw workflow input.
+          if [ -f /tmp/resolved_file_names.txt ] && [ -s /tmp/resolved_file_names.txt ]; then
+            FILE_NAMES_INPUT=$(cat /tmp/resolved_file_names.txt)
+            echo "📦 Using Snowflake-resolved dependency list: ${FILE_NAMES_INPUT}"
+          else
+            FILE_NAMES_INPUT="${{ inputs.file_names }}"
+            echo "📦 Using raw file_names input: ${FILE_NAMES_INPUT}"
+          fi
+
+          EXCLUDE_FILES="${{ inputs.exclude_files }}"
+          CHANGED_FILES=$(cat /tmp/all_changed_files.txt || true)
+
+          IFS=',' read -ra EXCLUDE_ARRAY <<< "$EXCLUDE_FILES"
+
+          FILES_TO_DEPLOY=""
+          NO_CHANGE_FILES=""
+          FAILED_FILES=""
+          NO_CHANGE_COUNT=0
+
+          if [ -z "$FILE_NAMES_INPUT" ]; then
+            echo "Mode: Full deployment (all changed files)"
+            FILES_TO_DEPLOY="$CHANGED_FILES"
+          else
+            echo "Mode: Selective deployment (Snowflake-resolved dbt models)"
+            IFS=',' read -ra INPUT_FILES <<< "$FILE_NAMES_INPUT"
+            for input in "${INPUT_FILES[@]}"; do
+              input=$(echo "$input" | xargs)
+              [ -z "$input" ] && continue
+
+              if echo "$input" | grep -q '\.'; then
+                MATCH=$(echo "$CHANGED_FILES" | grep -Fx "$input" || true)
+              else
+                MATCH=$(echo "$CHANGED_FILES" | grep -E "(^|/)${input}\.[a-zA-Z0-9]+$" || true)
+              fi
+
+              if [ -n "$MATCH" ]; then
+                FILES_TO_DEPLOY="${FILES_TO_DEPLOY}${MATCH}"$'\n'
+              else
+                git fetch origin "${{ inputs.source_branch }}" "${{ inputs.destination_branch }}"
+
+                if echo "$input" | grep -q '\.'; then
+                  SEARCH_FILE="$input"
+                else
+                  SEARCH_FILE=$(git ls-tree -r --name-only "origin/${{ inputs.source_branch }}" | grep -E "(^|/)${input}\.[a-zA-Z0-9]+$" | head -1 || true)
+                fi
+
+                if [ -n "$SEARCH_FILE" ]; then
+                  if git ls-tree -r --name-only "origin/${{ inputs.destination_branch }}" | grep -Fxq "$SEARCH_FILE"; then
+                    if git diff --quiet "origin/${{ inputs.destination_branch }}" "origin/${{ inputs.source_branch }}" -- "$SEARCH_FILE" 2>/dev/null; then
+                      NO_CHANGE_FILES="${NO_CHANGE_FILES}- ${SEARCH_FILE} (no changes between branches)"$'\n'
+                      NO_CHANGE_COUNT=$((NO_CHANGE_COUNT + 1))
+                    else
+                      FILES_TO_DEPLOY="${FILES_TO_DEPLOY}${SEARCH_FILE}"$'\n'
+                    fi
+                  else
+                    FILES_TO_DEPLOY="${FILES_TO_DEPLOY}${SEARCH_FILE}"$'\n'
+                  fi
+                else
+                  FAILED_FILES="${FAILED_FILES}- ${input} (file not found in source branch)"$'\n'
+                fi
+              fi
+            done
+          fi
+
+          # Remove excluded files
+          FILTERED_FILES=""
+          echo "$FILES_TO_DEPLOY" | sort -u > /tmp/files_to_deploy_temp.txt
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            SKIP=false
+            for ex in "${EXCLUDE_ARRAY[@]}"; do
+              echo "$file" | grep -Fq "$ex" && SKIP=true
+            done
+            if [ "$SKIP" = false ]; then
+              FILTERED_FILES="${FILTERED_FILES}${file}"$'\n'
+            fi
+          done < /tmp/files_to_deploy_temp.txt
+
+          echo "$FILTERED_FILES" | grep -v '^$' > /tmp/files_to_deploy.txt || true
+          echo "$NO_CHANGE_FILES"  > /tmp/no_change_files.txt
+          echo "$FAILED_FILES"     > /tmp/failed_files.txt
+          echo "$NO_CHANGE_COUNT"  > /tmp/no_change_count.txt
+
+          DEPLOY_COUNT=$(cat /tmp/files_to_deploy.txt | grep -c '^' || echo "0")
+
+          echo "Files to deploy: ${DEPLOY_COUNT}"
+          echo "No change files: ${NO_CHANGE_COUNT}"
+
+          if [ "$DEPLOY_COUNT" -eq 0 ]; then
+            echo "has_files_to_deploy=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ No files to deploy after filtering"
+          else
+            echo "has_files_to_deploy=true" >> "$GITHUB_OUTPUT"
+            echo "✅ ${DEPLOY_COUNT} files ready to deploy"
+          fi
+
+      - name: Create merger branch
+        id: create_branch
+        if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
+        run: |
+          set -e
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          SRC=$(echo "${{ inputs.source_branch }}" | tr '[:upper:]' '[:lower:]' | sed 's/[\/ ]/_/g')
+          DST=$(echo "${{ inputs.destination_branch }}" | tr '[:upper:]' '[:lower:]' | sed 's/[\/ ]/_/g')
+          MERGER_BRANCH="${SRC}_to_${DST}_merger_${TIMESTAMP}"
+          echo "merger_branch=${MERGER_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "Creating merger branch: ${MERGER_BRANCH}"
+
+          git fetch origin "${{ inputs.destination_branch }}"
+          git checkout -b "${MERGER_BRANCH}" "origin/${{ inputs.destination_branch }}"
+          git push -u origin "${MERGER_BRANCH}"
+          echo "✅ Merger branch created and pushed"
+
+      - name: Deploy files to merger branch
+        id: cherry_pick
+        if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
+        run: |
+          set -e
+          git checkout "${{ steps.create_branch.outputs.merger_branch }}"
+
+          DEPLOYED_NEW_FILES=""
+          DEPLOYED_MODIFIED_FILES=""
+          NEW_COUNT=0
+          MODIFIED_COUNT=0
+
+          git fetch origin "${{ inputs.source_branch }}"
+
+          declare -A FILE_STATUS_MAP
+          while IFS=$'\t' read -r status file; do
+            FILE_STATUS_MAP["$file"]="$status"
+          done < /tmp/all_changed_files_with_status.txt
+
+          echo "Processing files for deployment..."
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+
+            echo "  Deploying: $file"
+            git checkout "origin/${{ inputs.source_branch }}" -- "$file"
+            git add "$file"
+
+            STATUS="${FILE_STATUS_MAP[$file]}"
+            if [ "$STATUS" = "A" ]; then
+              DEPLOYED_NEW_FILES="${DEPLOYED_NEW_FILES}- ${file}"$'\n'
+              NEW_COUNT=$((NEW_COUNT + 1))
+            else
+              DEPLOYED_MODIFIED_FILES="${DEPLOYED_MODIFIED_FILES}- ${file}"$'\n'
+              MODIFIED_COUNT=$((MODIFIED_COUNT + 1))
+            fi
+          done < /tmp/files_to_deploy.txt
+
+          echo "$DEPLOYED_NEW_FILES"   > /tmp/deployed_new_files.txt
+          echo "$DEPLOYED_MODIFIED_FILES" > /tmp/deployed_modified_files.txt
+          echo "$NEW_COUNT"            > /tmp/new_count.txt
+          echo "$MODIFIED_COUNT"       > /tmp/modified_count.txt
+
+          TOTAL_DEPLOYED=$((NEW_COUNT + MODIFIED_COUNT))
+          echo "$TOTAL_DEPLOYED" > /tmp/deployed_count.txt
+
+          echo "Deployment summary:"
+          echo "  New files: ${NEW_COUNT}"
+          echo "  Modified files: ${MODIFIED_COUNT}"
+          echo "  Total deployed: ${TOTAL_DEPLOYED}"
+
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "✅ Changes staged successfully"
+          else
+            echo "⚠️ No changes staged (unexpected)"
+          fi
+
+      - name: Commit changes
+        if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
+        run: |
+          git commit -m "Automated deployment from ${{ inputs.source_branch }} to ${{ inputs.destination_branch }}"
+          git push origin "${{ steps.create_branch.outputs.merger_branch }}"
+          echo "✅ Changes committed and pushed"
+
+      - name: Create Pull Request
+        if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
+        uses: actions/github-script@v7
+        id: create_pr
+        env:
+          GITHUB_TOKEN:        ${{ inputs.github_token }}
+          SOURCE_BRANCH:       ${{ inputs.source_branch }}
+          DESTINATION_BRANCH:  ${{ inputs.destination_branch }}
+          MERGER_BRANCH:       ${{ steps.create_branch.outputs.merger_branch }}
+          DEPLOYER:            ${{ github.actor }}
+          FILE_NAMES:          ${{ inputs.file_names }}
+        with:
+          github-token: ${{ inputs.github_token }}
+          script: |
+            const fs = require('fs');
+
+            // ── Read all temp files ──────────────────────────────────────────
+            const deployedNewFiles      = fs.existsSync('/tmp/deployed_new_files.txt')       ? fs.readFileSync('/tmp/deployed_new_files.txt','utf8')       : '';
+            const deployedModifiedFiles = fs.existsSync('/tmp/deployed_modified_files.txt')  ? fs.readFileSync('/tmp/deployed_modified_files.txt','utf8')  : '';
+            const noChangeFiles         = fs.existsSync('/tmp/no_change_files.txt')          ? fs.readFileSync('/tmp/no_change_files.txt','utf8')          : '';
+            const failedFiles           = fs.existsSync('/tmp/failed_files.txt')             ? fs.readFileSync('/tmp/failed_files.txt','utf8')             : '';
+            const allChanges            = fs.existsSync('/tmp/all_changed_files.txt')        ? fs.readFileSync('/tmp/all_changed_files.txt','utf8')        : '';
+            const snowflakeSummary      = fs.existsSync('/tmp/snowflake_deps_summary.txt')   ? fs.readFileSync('/tmp/snowflake_deps_summary.txt','utf8')   : '';
+            const resolvedFiles         = fs.existsSync('/tmp/resolved_file_names.txt')      ? fs.readFileSync('/tmp/resolved_file_names.txt','utf8').trim(): '';
+
+            const newCount       = fs.existsSync('/tmp/new_count.txt')       ? fs.readFileSync('/tmp/new_count.txt','utf8').trim()       : '0';
+            const modifiedCount  = fs.existsSync('/tmp/modified_count.txt')  ? fs.readFileSync('/tmp/modified_count.txt','utf8').trim()  : '0';
+            const noChangeCount  = fs.existsSync('/tmp/no_change_count.txt') ? fs.readFileSync('/tmp/no_change_count.txt','utf8').trim() : '0';
+            const deployedCount  = fs.existsSync('/tmp/deployed_count.txt')  ? fs.readFileSync('/tmp/deployed_count.txt','utf8').trim()  : '0';
+
+            const filesList = allChanges.split('\n').filter(f => f.trim());
+
+            const src       = process.env.SOURCE_BRANCH      || '';
+            const dst       = process.env.DESTINATION_BRANCH || '';
+            const headBranch= process.env.MERGER_BRANCH      || '';
+            const actor     = process.env.DEPLOYER           || '';
+            const fileNames = process.env.FILE_NAMES         || '';
+
+            // ── PR Title with date ───────────────────────────────────────────
+            const now  = new Date();
+            const dd   = String(now.getDate()).padStart(2, '0');
+            const mm   = String(now.getMonth() + 1).padStart(2, '0');
+            const yyyy = now.getFullYear();
+            const dateStr = `${dd}-${mm}-${yyyy}`;
+            const prTitle = `Deployment: ${src} → ${dst} | Summary || ${dateStr}`;
+
+            // ── PR Body ──────────────────────────────────────────────────────
+            let bodyText = '## 🚀 Deployment Request\n\n';
+            bodyText += `**Source Branch:** \`${src}\`\n`;
+            bodyText += `**Destination Branch:** \`${dst}\`\n`;
+            bodyText += `**Triggered by:** @${actor}\n\n`;
+
+            // ── Snowflake dependency section (new) ───────────────────────────
+            if (fileNames && snowflakeSummary.trim()) {
+              bodyText += '### 🔍 Snowflake Dependency Resolution\n\n';
+              bodyText += `**mart_views queried:** \`${fileNames}\`\n\n`;
+              if (resolvedFiles) {
+                const resolvedList = resolvedFiles.split(',').filter(f => f.trim());
+                bodyText += `**dbt models resolved:** ${resolvedList.length}\n`;
+                bodyText += '<details><summary>Click to expand resolved models</summary>\n\n';
+                resolvedList.forEach(m => { bodyText += `- \`${m}\`\n`; });
+                bodyText += '\n</details>\n\n';
+              }
+              bodyText += '<details><summary>View full lineage breakdown</summary>\n\n';
+              bodyText += '```\n' + snowflakeSummary + '\n```\n';
+              bodyText += '\n</details>\n\n';
+            }
+
+            // ── Deployment summary (existing, unchanged) ─────────────────────
+            bodyText += '### 📋 Deployment Summary\n\n';
+
+            if (!fileNames) {
+              bodyText += `**Mode:** Full deployment (all changes)\n`;
+              bodyText += `**Total changes in source:** ${filesList.length} files\n`;
+            } else {
+              bodyText += `**Mode:** Selective deployment (Snowflake-resolved dbt models)\n`;
+            }
+
+            bodyText += `**✅ Successfully deployed:** ${deployedCount} files (${newCount} new, ${modifiedCount} modified)\n`;
+
+            if (parseInt(noChangeCount) > 0) {
+              bodyText += `**ℹ️ No changes:** ${noChangeCount} files\n`;
+            }
+
+            if (failedFiles.trim()) {
+              const failedCount = failedFiles.split('\n').filter(f => f.trim()).length;
+              bodyText += `**❌ Failed:** ${failedCount} files\n`;
+            }
+
+            bodyText += '\n';
+
+            if (deployedNewFiles.trim()) {
+              bodyText += '### ✨ New Files Deployed\n';
+              bodyText += '```\n' + deployedNewFiles + '```\n\n';
+            }
+
+            if (deployedModifiedFiles.trim()) {
+              bodyText += '### 📝 Modified Files Deployed\n';
+              bodyText += '```\n' + deployedModifiedFiles + '```\n\n';
+            }
+
+            if (noChangeFiles.trim()) {
+              bodyText += '### ℹ️ Files with No Changes\n';
+              bodyText += '```\n' + noChangeFiles + '```\n\n';
+            }
+
+            if (failedFiles.trim()) {
+              bodyText += '### ⚠️ Failed/Not Found Files\n';
+              bodyText += '```\n' + failedFiles + '```\n\n';
+            }
+
+            bodyText += '### 🔒 Excluded Files (Auto-restored from destination if present)\n';
+            bodyText += '- source.yml\n- relx_fivetran_connector_mapping.csv\n\n';
+
+            bodyText += '### 📝 Next Steps\n';
+            bodyText += '1. Review the changes in this PR\n';
+            bodyText += '2. Approve the PR if everything looks correct\n';
+            bodyText += '3. Merge to deploy to `' + dst + '`\n';
+            bodyText += '4. **Manual Step**: Run your dbt jobs after merge\n\n';
+
+            if (!fileNames) {
+              bodyText += `### 📊 All Changed Files in Source\n<details><summary>Click to expand (${filesList.length} files)</summary>\n\n`;
+              filesList.forEach(file => { bodyText += `- ${file}\n`; });
+              bodyText += `\n</details>`;
+            }
+
+            const pr = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: prTitle,
+              head:  headBranch,
+              base:  dst,
+              body:  bodyText
+            });
+
+            core.info(`✅ Pull Request #${pr.data.number} created successfully`);
+            core.info(`🔗 PR URL: ${pr.data.html_url}`);
+
+            return pr.data.number;
+
+      - name: Add labels to PR
+        if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ inputs.github_token }}
+          PR_NUMBER:    ${{ steps.create_pr.outputs.result }}
+        with:
+          github-token: ${{ inputs.github_token }}
+          script: |
+            const prNumber = Number(process.env.PR_NUMBER || 0);
+            if (!prNumber) {
+              console.log('No PR number available; skipping label addition.');
+              return;
+            }
+            try {
+              await github.rest.issues.addLabels({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: prNumber,
+                labels:       ['automated-deployment', 'deployment']
+              });
+              console.log('Labels added to PR:', prNumber);
+            } catch (error) {
+              console.log('Could not add labels (they may not exist):', error.message);
+            }
+
+      - name: Summary - Success
+        if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
+        run: |
+          NEW_COUNT=$(cat /tmp/new_count.txt)
+          MODIFIED_COUNT=$(cat /tmp/modified_count.txt)
+          NO_CHANGE_COUNT=$(cat /tmp/no_change_count.txt)
+          DEPLOYED_COUNT=$(cat /tmp/deployed_count.txt)
+
+          echo "## ✅ Deployment PR Created Successfully" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**PR Number:** ${{ steps.create_pr.outputs.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Merger Branch:** \`${{ steps.create_branch.outputs.merger_branch }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f /tmp/snowflake_deps_summary.txt ] && [ -s /tmp/snowflake_deps_summary.txt ]; then
+            echo "### 🔍 Snowflake Dependency Resolution" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/snowflake_deps_summary.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "### Deployment Statistics:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ✅ **Successfully Deployed:** ${DEPLOYED_COUNT} files" >> "$GITHUB_STEP_SUMMARY"
+          echo "  - ✨ New files: ${NEW_COUNT}" >> "$GITHUB_STEP_SUMMARY"
+          echo "  - 📝 Modified files: ${MODIFIED_COUNT}" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$NO_CHANGE_COUNT" != "0" ]; then
+            echo "- ℹ️ **No Changes:** ${NO_CHANGE_COUNT} files" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Next Steps:" >> "$GITHUB_STEP_SUMMARY"
+          echo "1. Review the PR at the link above" >> "$GITHUB_STEP_SUMMARY"
+          echo "2. Request review from your team" >> "$GITHUB_STEP_SUMMARY"
+          echo "3. Merge after approval" >> "$GITHUB_STEP_SUMMARY"
+          echo "4. **Manually run your dbt jobs after merge**" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summary - No Changes
+        if: steps.check_changes.outputs.has_changes == 'false' || steps.analyze_files.outputs.has_files_to_deploy == 'false'
+        run: |
+          echo "## ℹ️ No Changes to Deploy" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ steps.check_changes.outputs.has_changes }}" == "false" ]; then
+            echo "**Reason:** No differences found between \`${{ inputs.source_branch }}\` and \`${{ inputs.destination_branch }}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "**Reason:** All files were either excluded or had no changes" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "No merger branch was created." >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f /tmp/snowflake_deps_summary.txt ] && [ -s /tmp/snowflake_deps_summary.txt ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### 🔍 Snowflake Dependency Resolution (no changed files found)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/snowflake_deps_summary.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -f /tmp/no_change_files.txt ] && [ -s /tmp/no_change_files.txt ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Files with No Changes:" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/no_change_files.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -f /tmp/failed_files.txt ] && [ -s /tmp/failed_files.txt ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Files Not Found:" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/failed_files.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -1,19 +1,15 @@
-name: Uggraded Automated Deployment
+name: Upgraded Automated Deployment
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SNOWFLAKE SECRETS — set these once in your repo:
-#   Settings → Secrets and variables → Actions → New repository secret
+# Dependency resolution is handled entirely from your local dbt project files.
+# No database credentials are required.
 #
-#   SNOWFLAKE_ACCOUNT   e.g. xy12345.us-east-1
-#   SNOWFLAKE_USER      e.g. my_service_user
-#   SNOWFLAKE_PASSWORD  e.g. ••••••••
-#   SNOWFLAKE_DATABASE  e.g. ANALYTICS
-#   SNOWFLAKE_SCHEMA    e.g. DBT_AUDIT
-#   SNOWFLAKE_WAREHOUSE e.g. COMPUTE_WH
-#
-# The workflow will query audit_model_lineage and resolve all dbt dependencies
-# (mart_tables, wh_1f, stg-tables, seed_names, source_pvo) for the mart_views
-# you pass in file_names. Only changed files among those dependencies are deployed.
+# How selective deployment works:
+#   Pass any comma-separated list of dbt model names in `file_names`.
+#   The workflow will parse every .sql file in your project, build a full
+#   ref() dependency graph, and recursively resolve ALL upstream dependencies
+#   for each model you provide — regardless of whether it's a mart, staging,
+#   intermediate, seed, or source model.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -32,7 +28,10 @@ on:
         required: true
         type: string
       file_names:
-        description: 'Comma-separated mart_views to resolve dependencies for (extension optional). Leave empty for full deployment.'
+        description: |
+          Comma-separated dbt model names to resolve dependencies for (extension optional).
+          Accepts any model type: marts, staging, intermediate, seeds, etc.
+          Leave empty for full deployment of all changed files.
         required: false
         type: string
       exclude_files:
@@ -88,136 +87,199 @@ jobs:
           echo "✅ Now on destination branch context"
 
       # ───────────────────────────────────────────────────────────────────────
-      # SNOWFLAKE DEPENDENCY RESOLUTION
+      # DBT DEPENDENCY RESOLUTION
       # Runs only when file_names is provided (selective deployment mode).
-      # Queries audit_model_lineage to expand mart_views → all dbt model names.
-      # Credentials are read from GitHub repository secrets (never visible in UI).
+      #
+      # Strategy — no DB connection needed:
+      #   1. Reads dbt_project.yml to find model/seed/snapshot paths.
+      #   2. Parses every .sql file and extracts ref() / source() calls to
+      #      build a complete in-memory dependency graph.
+      #   3. Walks the graph recursively for every model you supplied,
+      #      collecting ALL upstream ancestors (including seeds & sources).
+      #   4. Writes the flat list of resolved model names to a temp file
+      #      consumed by the "Analyze files to deploy" step below.
       # ───────────────────────────────────────────────────────────────────────
-      - name: Fetch dependencies from Snowflake
-        id: snowflake_deps
+      - name: Checkout source branch for dbt parsing
+        if: inputs.file_names != ''
+        run: |
+          git fetch origin "${{ inputs.source_branch }}"
+          git checkout "origin/${{ inputs.source_branch }}" -- .
+          echo "✅ Source branch files checked out for dbt graph parsing"
+
+      - name: Resolve dbt dependencies from project files
+        id: dbt_deps
         if: inputs.file_names != ''
         env:
-          FILE_NAMES:          ${{ inputs.file_names }}
-          SNOWFLAKE_ACCOUNT:   ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER:      ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD:  ${{ secrets.SNOWFLAKE_PASSWORD }}
-          SNOWFLAKE_DATABASE:  ${{ secrets.SNOWFLAKE_DATABASE }}
-          SNOWFLAKE_SCHEMA:    ${{ secrets.SNOWFLAKE_SCHEMA }}
-          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          FILE_NAMES: ${{ inputs.file_names }}
         run: |
-          echo "Installing Snowflake connector..."
-          pip install snowflake-connector-python --quiet
-
           python3 << 'PYEOF'
-          import snowflake.connector
           import os
+          import re
           import sys
+          import json
+          from pathlib import Path
+          from collections import defaultdict
 
-          file_names = os.environ.get('FILE_NAMES', '').strip()
-          views      = [v.strip() for v in file_names.split(',') if v.strip()]
+          # ── 1. Parse inputs ────────────────────────────────────────────────
+          file_names   = os.environ.get('FILE_NAMES', '').strip()
+          input_models = [m.strip().split('.')[0] for m in file_names.split(',') if m.strip()]
 
-          if not views:
-              print("No views provided — skipping Snowflake lookup")
+          if not input_models:
+              print("No models provided — skipping dbt dependency resolution")
               sys.exit(0)
 
-          print(f"Querying audit_model_lineage for {len(views)} mart_view(s): {views}")
+          print(f"Input models: {input_models}")
 
-          try:
-              conn = snowflake.connector.connect(
-                  account   = os.environ['SNOWFLAKE_ACCOUNT'],
-                  user      = os.environ['SNOWFLAKE_USER'],
-                  password  = os.environ['SNOWFLAKE_PASSWORD'],
-                  database  = os.environ['SNOWFLAKE_DATABASE'],
-                  schema    = os.environ['SNOWFLAKE_SCHEMA'],
-                  warehouse = os.environ['SNOWFLAKE_WAREHOUSE'],
-              )
-          except Exception as e:
-              print(f"❌ Snowflake connection failed: {e}")
-              sys.exit(1)
+          # ── 2. Discover project paths from dbt_project.yml ─────────────────
+          def parse_dbt_project_paths():
+              """
+              Reads dbt_project.yml to find model-paths, seed-paths, and
+              snapshot-paths. Falls back to dbt defaults if the file is absent
+              or the keys are missing.
+              """
+              defaults = {
+                  'model_paths':    ['models'],
+                  'seed_paths':     ['seeds'],
+                  'snapshot_paths': ['snapshots'],
+                  'analysis_paths': ['analyses'],
+              }
+              project_file = Path('dbt_project.yml')
+              if not project_file.exists():
+                  print("⚠️  dbt_project.yml not found — using default paths")
+                  return defaults
 
-          placeholders = ','.join(['%s'] * len(views))
+              content = project_file.read_text()
+              result  = dict(defaults)
 
-          # stg-tables has a hyphen so must be double-quoted in Snowflake SQL
-          query = f"""
-              SELECT
-                  mart_views,
-                  mart_tables,
-                  wh_1f,
-                  "stg-tables",
-                  seed_names,
-                  source_pvo
-              FROM audit_model_lineage
-              WHERE mart_views IN ({placeholders})
-          """
+              # Simple line-by-line parser (avoids a PyYAML dependency)
+              key_map = {
+                  'model-paths':    'model_paths',
+                  'source-paths':   'model_paths',   # dbt <1.0 alias
+                  'seed-paths':     'seed_paths',
+                  'snapshot-paths': 'snapshot_paths',
+                  'analysis-paths': 'analysis_paths',
+              }
+              path_re = re.compile(r"^\s*-\s+['\"]?([^'\"]+)['\"]?\s*$")
+              current_key = None
 
-          try:
-              cur = conn.cursor()
-              cur.execute(query, views)
-              rows = cur.fetchall()
-          except Exception as e:
-              print(f"❌ Query failed: {e}")
-              conn.close()
-              sys.exit(1)
+              for line in content.splitlines():
+                  stripped = line.strip().rstrip(':')
+                  if stripped in key_map:
+                      current_key = key_map[stripped]
+                      result[current_key] = []
+                  elif current_key and path_re.match(line):
+                      result[current_key].append(path_re.match(line).group(1))
+                  elif stripped and not line.startswith(' ') and not line.startswith('\t'):
+                      current_key = None
 
-          conn.close()
+              print(f"Project paths → models: {result['model_paths']}  "
+                    f"seeds: {result['seed_paths']}  snapshots: {result['snapshot_paths']}")
+              return result
 
-          if not rows:
-              print("⚠️  No rows returned from audit_model_lineage for the given views.")
-              print("Falling back to the original file_names as-is.")
-              with open('/tmp/resolved_file_names.txt', 'w') as f:
-                  f.write(file_names)
-              with open('/tmp/snowflake_deps_summary.txt', 'w') as f:
-                  f.write("No matching rows found in audit_model_lineage.\n")
-              sys.exit(0)
+          paths = parse_dbt_project_paths()
 
-          # Columns: mart_views(0) mart_tables(1) wh_1f(2) stg-tables(3) seed_names(4) source_pvo(5)
-          COLUMN_LABELS = [
-              ('mart_tables', 1),
-              ('wh_1f',       2),
-              ('stg-tables',  3),
-              ('seed_names',  4),
-              ('source_pvo',  5),
-          ]
+          # ── 3. Build the dependency graph ──────────────────────────────────
+          # graph:    model_name → [list of upstream model names it refs]
+          # file_map: model_name → relative file path in the repo
+          graph    = defaultdict(list)
+          file_map = {}
 
-          all_deps      = set()   # flat set of every dbt model name found
-          not_found     = []      # views the user passed but weren't in the table
-          summary_lines = []
+          REF_RE    = re.compile(r"{{\s*ref\s*\(\s*['\"]([^'\"]+)['\"]\s*(?:,\s*['\"][^'\"]*['\"]\s*)?\)\s*}}")
+          SOURCE_RE = re.compile(r"{{\s*source\s*\(\s*['\"][^'\"]+['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)\s*}}")
 
-          found_views = {row[0] for row in rows}
-          for v in views:
-              if v not in found_views:
-                  not_found.append(v)
+          def index_directory(base_dirs, extensions):
+              """Walk base_dirs, index all files matching extensions."""
+              for base in base_dirs:
+                  p = Path(base)
+                  if not p.exists():
+                      continue
+                  for ext in extensions:
+                      for f in p.rglob(f'*.{ext}'):
+                          model_name = f.stem
+                          rel_path   = str(f)
+                          file_map[model_name] = rel_path
 
-          for row in rows:
-              view     = row[0]
-              per_view = {}
-              for label, idx in COLUMN_LABELS:
-                  val = row[idx]
-                  if val and str(val).strip():
-                      model_name = str(val).strip()
-                      all_deps.add(model_name)
-                      per_view[label] = model_name
+                          if ext == 'sql':
+                              content = f.read_text(encoding='utf-8', errors='replace')
+                              refs    = REF_RE.findall(content)
+                              sources = SOURCE_RE.findall(content)
+                              graph[model_name].extend(refs)
+                              # Sources are leaf nodes — add them to file_map
+                              # but they have no further SQL deps themselves
+                              for src in sources:
+                                  if src not in file_map:
+                                      file_map[src] = None   # source: no file to deploy
+                          elif ext == 'csv':
+                              graph[model_name] = []         # seeds have no upstream SQL deps
 
-              summary_lines.append(f"mart_view : {view}")
-              for label, idx in COLUMN_LABELS:
-                  dep_val = per_view.get(label, '(none)')
-                  summary_lines.append(f"  {label:<14}: {dep_val}")
+          # Index models (SQL) and seeds (CSV) and snapshots (SQL)
+          index_directory(paths['model_paths'],    ['sql'])
+          index_directory(paths['seed_paths'],     ['csv'])
+          index_directory(paths['snapshot_paths'], ['sql'])
+
+          total_nodes = len(file_map)
+          total_edges = sum(len(v) for v in graph.values())
+          print(f"Graph built: {total_nodes} nodes, {total_edges} dependency edges")
+
+          # ── 4. Recursive upstream traversal ────────────────────────────────
+          def get_all_upstream(model_name, visited=None):
+              """Return the model itself plus every upstream ancestor."""
+              if visited is None:
+                  visited = set()
+              if model_name in visited:
+                  return visited
+              visited.add(model_name)
+              for upstream in graph.get(model_name, []):
+                  get_all_upstream(upstream, visited)
+              return visited
+
+          all_resolved   = set()
+          not_found      = []
+          summary_lines  = []
+
+          for model in input_models:
+              if model not in file_map and model not in graph:
+                  not_found.append(model)
+                  summary_lines.append(f"model     : {model}")
+                  summary_lines.append(f"  status  : ⚠️  NOT FOUND in dbt project")
+                  summary_lines.append("")
+                  continue
+
+              deps = get_all_upstream(model)
+              # Filter to only models that have actual files (excludes pure sources)
+              deployable = {d for d in deps if file_map.get(d) is not None}
+              all_resolved.update(deployable)
+
+              summary_lines.append(f"model     : {model}")
+              summary_lines.append(f"  self    : {file_map.get(model, '(no file)')}")
+              summary_lines.append(f"  total upstream deps resolved: {len(deployable) - 1}")
+              for dep in sorted(deployable - {model}):
+                  summary_lines.append(f"    ↳ {dep}  →  {file_map.get(dep, '?')}")
               summary_lines.append("")
 
           if not_found:
-              summary_lines.append("Views not found in audit_model_lineage:")
-              for v in not_found:
-                  summary_lines.append(f"  ⚠️  {v}")
+              summary_lines.append("Models not found in dbt project:")
+              for m in not_found:
+                  summary_lines.append(f"  ⚠️  {m}")
 
+          # ── 5. Write outputs ────────────────────────────────────────────────
+          # resolved_file_names.txt  → comma-separated model names (consumed downstream)
+          # dbt_deps_summary.txt     → human-readable breakdown for the PR body
           with open('/tmp/resolved_file_names.txt', 'w') as f:
-              f.write(','.join(sorted(all_deps)))
+              f.write(','.join(sorted(all_resolved)))
 
-          with open('/tmp/snowflake_deps_summary.txt', 'w') as f:
+          with open('/tmp/dbt_deps_summary.txt', 'w') as f:
               f.write('\n'.join(summary_lines))
 
-          print(f"✅ Resolved {len(all_deps)} dbt model(s) across {len(rows)} view(s)")
-          print("Models to deploy:", sorted(all_deps))
+          print(f"✅ Resolved {len(all_resolved)} unique model(s) across {len(input_models)} input(s)")
+          print("Models to deploy:", sorted(all_resolved))
           PYEOF
+
+      - name: Restore destination branch context after dbt parsing
+        if: inputs.file_names != ''
+        run: |
+          git checkout "${{ inputs.destination_branch }}"
+          echo "✅ Restored destination branch context"
 
       - name: Get changed files with status
         id: check_changes
@@ -249,11 +311,11 @@ jobs:
         if: steps.check_changes.outputs.has_changes == 'true'
         run: |
           # ── Resolve which file list to use ────────────────────────────────
-          # If Snowflake resolved dependencies, use those; otherwise fall back
+          # If dbt resolved dependencies, use those; otherwise fall back
           # to the raw workflow input.
           if [ -f /tmp/resolved_file_names.txt ] && [ -s /tmp/resolved_file_names.txt ]; then
             FILE_NAMES_INPUT=$(cat /tmp/resolved_file_names.txt)
-            echo "📦 Using Snowflake-resolved dependency list: ${FILE_NAMES_INPUT}"
+            echo "📦 Using dbt-resolved dependency list: ${FILE_NAMES_INPUT}"
           else
             FILE_NAMES_INPUT="${{ inputs.file_names }}"
             echo "📦 Using raw file_names input: ${FILE_NAMES_INPUT}"
@@ -273,7 +335,7 @@ jobs:
             echo "Mode: Full deployment (all changed files)"
             FILES_TO_DEPLOY="$CHANGED_FILES"
           else
-            echo "Mode: Selective deployment (Snowflake-resolved dbt models)"
+            echo "Mode: Selective deployment (dbt-resolved models)"
             IFS=',' read -ra INPUT_FILES <<< "$FILE_NAMES_INPUT"
             for input in "${INPUT_FILES[@]}"; do
               input=$(echo "$input" | xargs)
@@ -401,13 +463,13 @@ jobs:
             fi
           done < /tmp/files_to_deploy.txt
 
-          echo "$DEPLOYED_NEW_FILES"   > /tmp/deployed_new_files.txt
+          echo "$DEPLOYED_NEW_FILES"      > /tmp/deployed_new_files.txt
           echo "$DEPLOYED_MODIFIED_FILES" > /tmp/deployed_modified_files.txt
-          echo "$NEW_COUNT"            > /tmp/new_count.txt
-          echo "$MODIFIED_COUNT"       > /tmp/modified_count.txt
+          echo "$NEW_COUNT"               > /tmp/new_count.txt
+          echo "$MODIFIED_COUNT"          > /tmp/modified_count.txt
 
           TOTAL_DEPLOYED=$((NEW_COUNT + MODIFIED_COUNT))
-          echo "$TOTAL_DEPLOYED" > /tmp/deployed_count.txt
+          echo "$TOTAL_DEPLOYED"          > /tmp/deployed_count.txt
 
           echo "Deployment summary:"
           echo "  New files: ${NEW_COUNT}"
@@ -444,32 +506,32 @@ jobs:
             const fs = require('fs');
 
             // ── Read all temp files ──────────────────────────────────────────
-            const deployedNewFiles      = fs.existsSync('/tmp/deployed_new_files.txt')       ? fs.readFileSync('/tmp/deployed_new_files.txt','utf8')       : '';
-            const deployedModifiedFiles = fs.existsSync('/tmp/deployed_modified_files.txt')  ? fs.readFileSync('/tmp/deployed_modified_files.txt','utf8')  : '';
-            const noChangeFiles         = fs.existsSync('/tmp/no_change_files.txt')          ? fs.readFileSync('/tmp/no_change_files.txt','utf8')          : '';
-            const failedFiles           = fs.existsSync('/tmp/failed_files.txt')             ? fs.readFileSync('/tmp/failed_files.txt','utf8')             : '';
-            const allChanges            = fs.existsSync('/tmp/all_changed_files.txt')        ? fs.readFileSync('/tmp/all_changed_files.txt','utf8')        : '';
-            const snowflakeSummary      = fs.existsSync('/tmp/snowflake_deps_summary.txt')   ? fs.readFileSync('/tmp/snowflake_deps_summary.txt','utf8')   : '';
-            const resolvedFiles         = fs.existsSync('/tmp/resolved_file_names.txt')      ? fs.readFileSync('/tmp/resolved_file_names.txt','utf8').trim(): '';
+            const deployedNewFiles      = fs.existsSync('/tmp/deployed_new_files.txt')      ? fs.readFileSync('/tmp/deployed_new_files.txt','utf8')      : '';
+            const deployedModifiedFiles = fs.existsSync('/tmp/deployed_modified_files.txt') ? fs.readFileSync('/tmp/deployed_modified_files.txt','utf8') : '';
+            const noChangeFiles         = fs.existsSync('/tmp/no_change_files.txt')         ? fs.readFileSync('/tmp/no_change_files.txt','utf8')         : '';
+            const failedFiles           = fs.existsSync('/tmp/failed_files.txt')            ? fs.readFileSync('/tmp/failed_files.txt','utf8')            : '';
+            const allChanges            = fs.existsSync('/tmp/all_changed_files.txt')       ? fs.readFileSync('/tmp/all_changed_files.txt','utf8')       : '';
+            const dbtSummary            = fs.existsSync('/tmp/dbt_deps_summary.txt')        ? fs.readFileSync('/tmp/dbt_deps_summary.txt','utf8')        : '';
+            const resolvedFiles         = fs.existsSync('/tmp/resolved_file_names.txt')     ? fs.readFileSync('/tmp/resolved_file_names.txt','utf8').trim(): '';
 
-            const newCount       = fs.existsSync('/tmp/new_count.txt')       ? fs.readFileSync('/tmp/new_count.txt','utf8').trim()       : '0';
-            const modifiedCount  = fs.existsSync('/tmp/modified_count.txt')  ? fs.readFileSync('/tmp/modified_count.txt','utf8').trim()  : '0';
-            const noChangeCount  = fs.existsSync('/tmp/no_change_count.txt') ? fs.readFileSync('/tmp/no_change_count.txt','utf8').trim() : '0';
-            const deployedCount  = fs.existsSync('/tmp/deployed_count.txt')  ? fs.readFileSync('/tmp/deployed_count.txt','utf8').trim()  : '0';
+            const newCount      = fs.existsSync('/tmp/new_count.txt')       ? fs.readFileSync('/tmp/new_count.txt','utf8').trim()       : '0';
+            const modifiedCount = fs.existsSync('/tmp/modified_count.txt')  ? fs.readFileSync('/tmp/modified_count.txt','utf8').trim()  : '0';
+            const noChangeCount = fs.existsSync('/tmp/no_change_count.txt') ? fs.readFileSync('/tmp/no_change_count.txt','utf8').trim() : '0';
+            const deployedCount = fs.existsSync('/tmp/deployed_count.txt')  ? fs.readFileSync('/tmp/deployed_count.txt','utf8').trim()  : '0';
 
             const filesList = allChanges.split('\n').filter(f => f.trim());
 
-            const src       = process.env.SOURCE_BRANCH      || '';
-            const dst       = process.env.DESTINATION_BRANCH || '';
-            const headBranch= process.env.MERGER_BRANCH      || '';
-            const actor     = process.env.DEPLOYER           || '';
-            const fileNames = process.env.FILE_NAMES         || '';
+            const src        = process.env.SOURCE_BRANCH      || '';
+            const dst        = process.env.DESTINATION_BRANCH || '';
+            const headBranch = process.env.MERGER_BRANCH      || '';
+            const actor      = process.env.DEPLOYER           || '';
+            const fileNames  = process.env.FILE_NAMES         || '';
 
             // ── PR Title with date ───────────────────────────────────────────
-            const now  = new Date();
-            const dd   = String(now.getDate()).padStart(2, '0');
-            const mm   = String(now.getMonth() + 1).padStart(2, '0');
-            const yyyy = now.getFullYear();
+            const now     = new Date();
+            const dd      = String(now.getDate()).padStart(2, '0');
+            const mm      = String(now.getMonth() + 1).padStart(2, '0');
+            const yyyy    = now.getFullYear();
             const dateStr = `${dd}-${mm}-${yyyy}`;
             const prTitle = `Deployment: ${src} → ${dst} | Summary || ${dateStr}`;
 
@@ -479,30 +541,30 @@ jobs:
             bodyText += `**Destination Branch:** \`${dst}\`\n`;
             bodyText += `**Triggered by:** @${actor}\n\n`;
 
-            // ── Snowflake dependency section (new) ───────────────────────────
-            if (fileNames && snowflakeSummary.trim()) {
-              bodyText += '### 🔍 Snowflake Dependency Resolution\n\n';
-              bodyText += `**mart_views queried:** \`${fileNames}\`\n\n`;
+            // ── dbt dependency section ───────────────────────────────────────
+            if (fileNames && dbtSummary.trim()) {
+              bodyText += '### 🔍 dbt Dependency Resolution\n\n';
+              bodyText += `**Models requested:** \`${fileNames}\`\n\n`;
               if (resolvedFiles) {
                 const resolvedList = resolvedFiles.split(',').filter(f => f.trim());
-                bodyText += `**dbt models resolved:** ${resolvedList.length}\n`;
+                bodyText += `**Total resolved (model + all upstream deps):** ${resolvedList.length}\n`;
                 bodyText += '<details><summary>Click to expand resolved models</summary>\n\n';
                 resolvedList.forEach(m => { bodyText += `- \`${m}\`\n`; });
                 bodyText += '\n</details>\n\n';
               }
-              bodyText += '<details><summary>View full lineage breakdown</summary>\n\n';
-              bodyText += '```\n' + snowflakeSummary + '\n```\n';
+              bodyText += '<details><summary>View full dependency tree breakdown</summary>\n\n';
+              bodyText += '```\n' + dbtSummary + '\n```\n';
               bodyText += '\n</details>\n\n';
             }
 
-            // ── Deployment summary (existing, unchanged) ─────────────────────
+            // ── Deployment summary ───────────────────────────────────────────
             bodyText += '### 📋 Deployment Summary\n\n';
 
             if (!fileNames) {
               bodyText += `**Mode:** Full deployment (all changes)\n`;
               bodyText += `**Total changes in source:** ${filesList.length} files\n`;
             } else {
-              bodyText += `**Mode:** Selective deployment (Snowflake-resolved dbt models)\n`;
+              bodyText += `**Mode:** Selective deployment (dbt-resolved models + upstream deps)\n`;
             }
 
             bodyText += `**✅ Successfully deployed:** ${deployedCount} files (${newCount} new, ${modifiedCount} modified)\n`;
@@ -544,7 +606,7 @@ jobs:
             bodyText += '### 📝 Next Steps\n';
             bodyText += '1. Review the changes in this PR\n';
             bodyText += '2. Approve the PR if everything looks correct\n';
-            bodyText += '3. Merge to deploy to `' + dst + '`\n';
+            bodyText += `3. Merge to deploy to \`${dst}\`\n`;
             bodyText += '4. **Manual Step**: Run your dbt jobs after merge\n\n';
 
             if (!fileNames) {
@@ -607,10 +669,10 @@ jobs:
           echo "**Merger Branch:** \`${{ steps.create_branch.outputs.merger_branch }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          if [ -f /tmp/snowflake_deps_summary.txt ] && [ -s /tmp/snowflake_deps_summary.txt ]; then
-            echo "### 🔍 Snowflake Dependency Resolution" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f /tmp/dbt_deps_summary.txt ] && [ -s /tmp/dbt_deps_summary.txt ]; then
+            echo "### 🔍 dbt Dependency Resolution" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
-            cat /tmp/snowflake_deps_summary.txt >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/dbt_deps_summary.txt >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -646,11 +708,11 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "No merger branch was created." >> "$GITHUB_STEP_SUMMARY"
 
-          if [ -f /tmp/snowflake_deps_summary.txt ] && [ -s /tmp/snowflake_deps_summary.txt ]; then
+          if [ -f /tmp/dbt_deps_summary.txt ] && [ -s /tmp/dbt_deps_summary.txt ]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "### 🔍 Snowflake Dependency Resolution (no changed files found)" >> "$GITHUB_STEP_SUMMARY"
+            echo "### 🔍 dbt Dependency Resolution (no changed files found)" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
-            cat /tmp/snowflake_deps_summary.txt >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/dbt_deps_summary.txt >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
           fi
 

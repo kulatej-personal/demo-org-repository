@@ -1,16 +1,4 @@
-name: Upgraded Automated Deployment
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Dependency resolution is handled entirely from your local dbt project files.
-# No database credentials are required.
-#
-# How selective deployment works:
-#   Pass any comma-separated list of dbt model names in `file_names`.
-#   The workflow will parse every .sql file in your project, build a full
-#   ref() dependency graph, and recursively resolve ALL upstream dependencies
-#   for each model you provide — regardless of whether it's a mart, staging,
-#   intermediate, seed, or source model.
-# ─────────────────────────────────────────────────────────────────────────────
+name: Automated Deployment - dbt Lineage Aware
 
 on:
   workflow_dispatch:
@@ -28,17 +16,19 @@ on:
         required: true
         type: string
       file_names:
-        description: |
-          Comma-separated dbt model names to resolve dependencies for (extension optional).
-          Accepts any model type: marts, staging, intermediate, seeds, etc.
-          Leave empty for full deployment of all changed files.
+        description: 'Comma-separated model names (extension optional). Lineage deps will be auto-resolved.'
         required: false
         type: string
       exclude_files:
-        description: 'Files to exclude'
+        description: 'Files to exclude (comma-separated)'
         required: false
         type: string
         default: 'source.yml,relx_fivetran_connector_mapping.csv'
+      resolve_lineage:
+        description: 'Resolve full dbt lineage dependencies automatically'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -50,243 +40,257 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
 
+      # ── 2. Git auth ───────────────────────────────────────────────────────────
       - name: Configure Git with Token
         run: |
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
           git config --global url."https://x-access-token:${{ inputs.github_token }}@github.com/".insteadOf "https://github.com/"
 
+      # ── 3. Validate branches ─────────────────────────────────────────────────
       - name: Validate branches exist
         run: |
           set -e
-          echo "Validating source branch: ${{ inputs.source_branch }}"
           git ls-remote --heads origin "${{ inputs.source_branch }}" | grep -q refs/heads || {
-            echo "Error: Source branch '${{ inputs.source_branch }}' does not exist"
-            exit 1
+            echo "Error: Source branch '${{ inputs.source_branch }}' does not exist"; exit 1
           }
-
-          echo "Validating destination branch: ${{ inputs.destination_branch }}"
           git ls-remote --heads origin "${{ inputs.destination_branch }}" | grep -q refs/heads || {
-            echo "Error: Destination branch '${{ inputs.destination_branch }}' does not exist"
-            exit 1
+            echo "Error: Destination branch '${{ inputs.destination_branch }}' does not exist"; exit 1
           }
+          echo "✅ Both branches validated"
 
-          echo "✅ Both branches validated successfully"
-
-      - name: Setup destination branch context
-        run: |
-          echo "Fetching destination branch: ${{ inputs.destination_branch }}"
-          git fetch origin "${{ inputs.destination_branch }}"
-          git checkout "${{ inputs.destination_branch }}"
-          echo "✅ Now on destination branch context"
-
-      # ───────────────────────────────────────────────────────────────────────
-      # DBT DEPENDENCY RESOLUTION
-      # Runs only when file_names is provided (selective deployment mode).
-      #
-      # Strategy — no DB connection needed:
-      #   1. Reads dbt_project.yml to find model/seed/snapshot paths.
-      #   2. Parses every .sql file and extracts ref() / source() calls to
-      #      build a complete in-memory dependency graph.
-      #   3. Walks the graph recursively for every model you supplied,
-      #      collecting ALL upstream ancestors (including seeds & sources).
-      #   4. Writes the flat list of resolved model names to a temp file
-      #      consumed by the "Analyze files to deploy" step below.
-      # ───────────────────────────────────────────────────────────────────────
-      - name: Checkout source branch for dbt parsing
-        if: inputs.file_names != ''
+      # ── 4. Fetch both branches ────────────────────────────────────────────────
+      - name: Fetch branches
         run: |
           git fetch origin "${{ inputs.source_branch }}"
-          git checkout "origin/${{ inputs.source_branch }}" -- .
-          echo "✅ Source branch files checked out for dbt graph parsing"
+          git fetch origin "${{ inputs.destination_branch }}"
 
-      - name: Resolve dbt dependencies from project files
-        id: dbt_deps
-        if: inputs.file_names != ''
-        env:
-          FILE_NAMES: ${{ inputs.file_names }}
+      # ── 5. Set up Python ─────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install pyyaml
+
+      # ── 6. dbt Lineage Resolution + Source Validation ────────────────────────
+      #
+      #   This single Python script does everything in one pass:
+      #     a) Checkout the SOURCE tree into /tmp/src_tree
+      #     b) Checkout the DESTINATION tree into /tmp/dst_tree
+      #     c) Build a full ref() dependency graph from all .sql files in source
+      #     d) Expand the user-supplied model list to include all transitive deps
+      #     e) Scan every staging .sql in the deploy set for source() calls
+      #     f) Parse every sources.yml in the DESTINATION tree
+      #     g) Emit:
+      #          /tmp/lineage_files_to_deploy.txt  – one file path per line
+      #          /tmp/missing_sources.txt           – "src.tbl (referenced in file)" lines
+      #          /tmp/lineage_summary.txt           – human-readable summary
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Resolve dbt lineage and validate sources
+        id: lineage
         run: |
           python3 << 'PYEOF'
-          import os
-          import re
-          import sys
-          import json
+          import os, re, sys, json
           from pathlib import Path
-          from collections import defaultdict
+          import subprocess, yaml
 
-          # ── 1. Parse inputs ────────────────────────────────────────────────
-          file_names   = os.environ.get('FILE_NAMES', '').strip()
-          input_models = [m.strip().split('.')[0] for m in file_names.split(',') if m.strip()]
+          # ── helpers ──────────────────────────────────────────────────────────
+          def git_tree_files(branch, suffix=None):
+              """Return list of (path, content) for all files on a git branch."""
+              result = subprocess.run(
+                  ["git", "ls-tree", "-r", "--name-only", f"origin/{branch}"],
+                  capture_output=True, text=True, check=True
+              )
+              files = result.stdout.strip().splitlines()
+              if suffix:
+                  files = [f for f in files if f.endswith(suffix)]
+              return files
 
-          if not input_models:
-              print("No models provided — skipping dbt dependency resolution")
-              sys.exit(0)
+          def git_show(branch, path):
+              result = subprocess.run(
+                  ["git", "show", f"origin/{branch}:{path}"],
+                  capture_output=True, text=True
+              )
+              return result.stdout if result.returncode == 0 else ""
 
-          print(f"Input models: {input_models}")
+          def extract_refs(sql):
+              return set(re.findall(r"""\{\{\s*ref\s*\(\s*['"]([^'"]+)['"]\s*\)\s*\}\}""", sql, re.I))
 
-          # ── 2. Discover project paths from dbt_project.yml ─────────────────
-          def parse_dbt_project_paths():
-              """
-              Reads dbt_project.yml to find model-paths, seed-paths, and
-              snapshot-paths. Falls back to dbt defaults if the file is absent
-              or the keys are missing.
-              """
-              defaults = {
-                  'model_paths':    ['models'],
-                  'seed_paths':     ['seeds'],
-                  'snapshot_paths': ['snapshots'],
-                  'analysis_paths': ['analyses'],
-              }
-              project_file = Path('dbt_project.yml')
-              if not project_file.exists():
-                  print("⚠️  dbt_project.yml not found — using default paths")
-                  return defaults
+          def extract_sources(sql):
+              return set(re.findall(
+                  r"""\{\{\s*source\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)\s*\}\}""",
+                  sql, re.I
+              ))
 
-              content = project_file.read_text()
-              result  = dict(defaults)
+          def model_name_from_path(path):
+              return Path(path).stem
 
-              # Simple line-by-line parser (avoids a PyYAML dependency)
-              key_map = {
-                  'model-paths':    'model_paths',
-                  'source-paths':   'model_paths',   # dbt <1.0 alias
-                  'seed-paths':     'seed_paths',
-                  'snapshot-paths': 'snapshot_paths',
-                  'analysis-paths': 'analysis_paths',
-              }
-              path_re = re.compile(r"^\s*-\s+['\"]?([^'\"]+)['\"]?\s*$")
-              current_key = None
+          # ── config ───────────────────────────────────────────────────────────
+          src_branch  = os.environ.get("SOURCE_BRANCH",      "${{ inputs.source_branch }}")
+          dst_branch  = os.environ.get("DESTINATION_BRANCH", "${{ inputs.destination_branch }}")
+          file_names  = os.environ.get("FILE_NAMES",         "${{ inputs.file_names }}")
+          resolve_lin = os.environ.get("RESOLVE_LINEAGE",    "${{ inputs.resolve_lineage }}").lower() == "true"
 
-              for line in content.splitlines():
-                  stripped = line.strip().rstrip(':')
-                  if stripped in key_map:
-                      current_key = key_map[stripped]
-                      result[current_key] = []
-                  elif current_key and path_re.match(line):
-                      result[current_key].append(path_re.match(line).group(1))
-                  elif stripped and not line.startswith(' ') and not line.startswith('\t'):
-                      current_key = None
+          # ── collect all .sql files on SOURCE branch ──────────────────────────
+          print("📂 Collecting SQL files from source branch …")
+          src_sql_files = git_tree_files(src_branch, suffix=".sql")
 
-              print(f"Project paths → models: {result['model_paths']}  "
-                    f"seeds: {result['seed_paths']}  snapshots: {result['snapshot_paths']}")
-              return result
+          # Build map:  model_name → repo_path
+          model_map = {}      # name → path
+          model_sql  = {}      # name → sql content
+          for f in src_sql_files:
+              name = model_name_from_path(f)
+              sql  = git_show(src_branch, f)
+              model_map[name] = f
+              model_sql[name] = sql
 
-          paths = parse_dbt_project_paths()
+          # ── build dependency graph ─────────────────────────────────────────
+          # dep_graph[model] = set of model names it depends on (via ref())
+          dep_graph = {}
+          for name, sql in model_sql.items():
+              dep_graph[name] = extract_refs(sql)
 
-          # ── 3. Build the dependency graph ──────────────────────────────────
-          # graph:    model_name → [list of upstream model names it refs]
-          # file_map: model_name → relative file path in the repo
-          graph    = defaultdict(list)
-          file_map = {}
-
-          REF_RE    = re.compile(r"{{\s*ref\s*\(\s*['\"]([^'\"]+)['\"]\s*(?:,\s*['\"][^'\"]*['\"]\s*)?\)\s*}}")
-          SOURCE_RE = re.compile(r"{{\s*source\s*\(\s*['\"][^'\"]+['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)\s*}}")
-
-          def index_directory(base_dirs, extensions):
-              """Walk base_dirs, index all files matching extensions."""
-              for base in base_dirs:
-                  p = Path(base)
-                  if not p.exists():
-                      continue
-                  for ext in extensions:
-                      for f in p.rglob(f'*.{ext}'):
-                          model_name = f.stem
-                          rel_path   = str(f)
-                          file_map[model_name] = rel_path
-
-                          if ext == 'sql':
-                              content = f.read_text(encoding='utf-8', errors='replace')
-                              refs    = REF_RE.findall(content)
-                              sources = SOURCE_RE.findall(content)
-                              graph[model_name].extend(refs)
-                              # Sources are leaf nodes — add them to file_map
-                              # but they have no further SQL deps themselves
-                              for src in sources:
-                                  if src not in file_map:
-                                      file_map[src] = None   # source: no file to deploy
-                          elif ext == 'csv':
-                              graph[model_name] = []         # seeds have no upstream SQL deps
-
-          # Index models (SQL) and seeds (CSV) and snapshots (SQL)
-          index_directory(paths['model_paths'],    ['sql'])
-          index_directory(paths['seed_paths'],     ['csv'])
-          index_directory(paths['snapshot_paths'], ['sql'])
-
-          total_nodes = len(file_map)
-          total_edges = sum(len(v) for v in graph.values())
-          print(f"Graph built: {total_nodes} nodes, {total_edges} dependency edges")
-
-          # ── 4. Recursive upstream traversal ────────────────────────────────
-          def get_all_upstream(model_name, visited=None):
-              """Return the model itself plus every upstream ancestor."""
+          def all_deps(model, visited=None):
+              """Return all transitive dependencies of a model (upstream)."""
               if visited is None:
                   visited = set()
-              if model_name in visited:
+              if model in visited:
                   return visited
-              visited.add(model_name)
-              for upstream in graph.get(model_name, []):
-                  get_all_upstream(upstream, visited)
+              visited.add(model)
+              for dep in dep_graph.get(model, set()):
+                  all_deps(dep, visited)
               return visited
 
-          all_resolved   = set()
-          not_found      = []
-          summary_lines  = []
+          # ── resolve user-supplied file list ──────────────────────────────────
+          raw_inputs = [f.strip() for f in file_names.split(",") if f.strip()] if file_names else []
 
-          for model in input_models:
-              if model not in file_map and model not in graph:
-                  not_found.append(model)
-                  summary_lines.append(f"model     : {model}")
-                  summary_lines.append(f"  status  : ⚠️  NOT FOUND in dbt project")
-                  summary_lines.append("")
-                  continue
+          seed_models = set()
+          not_found   = []
+          for inp in raw_inputs:
+              # strip extension if present
+              stem = Path(inp).stem
+              if stem in model_map:
+                  seed_models.add(stem)
+              else:
+                  not_found.append(inp)
 
-              deps = get_all_upstream(model)
-              # Filter to only models that have actual files (excludes pure sources)
-              deployable = {d for d in deps if file_map.get(d) is not None}
-              all_resolved.update(deployable)
+          # expand with lineage
+          deploy_models = set(seed_models)
+          if resolve_lin:
+              for m in list(seed_models):
+                  deploy_models |= all_deps(m)
+              print(f"  Seed models     : {len(seed_models)}")
+              print(f"  After lineage   : {len(deploy_models)}")
+          else:
+              print(f"  Models (no lineage expansion): {len(deploy_models)}")
 
-              summary_lines.append(f"model     : {model}")
-              summary_lines.append(f"  self    : {file_map.get(model, '(no file)')}")
-              summary_lines.append(f"  total upstream deps resolved: {len(deployable) - 1}")
-              for dep in sorted(deployable - {model}):
-                  summary_lines.append(f"    ↳ {dep}  →  {file_map.get(dep, '?')}")
-              summary_lines.append("")
+          # ── map back to file paths ────────────────────────────────────────────
+          deploy_paths = []
+          for m in deploy_models:
+              if m in model_map:
+                  deploy_paths.append(model_map[m])
 
-          if not_found:
-              summary_lines.append("Models not found in dbt project:")
-              for m in not_found:
-                  summary_lines.append(f"  ⚠️  {m}")
+          # Also include files that were explicitly requested but might be
+          # non-SQL (e.g. .csv seeds, .yml schema files) or found by full path
+          extra_paths = []
+          for inp in raw_inputs:
+              if Path(inp).suffix:               # has explicit extension
+                  src_all = git_tree_files(src_branch)
+                  matches = [f for f in src_all if f.endswith(inp) or f == inp]
+                  extra_paths.extend(matches)
 
-          # ── 5. Write outputs ────────────────────────────────────────────────
-          # resolved_file_names.txt  → comma-separated model names (consumed downstream)
-          # dbt_deps_summary.txt     → human-readable breakdown for the PR body
-          with open('/tmp/resolved_file_names.txt', 'w') as f:
-              f.write(','.join(sorted(all_resolved)))
+          all_deploy_paths = sorted(set(deploy_paths + extra_paths))
 
-          with open('/tmp/dbt_deps_summary.txt', 'w') as f:
-              f.write('\n'.join(summary_lines))
+          # ── source() validation ──────────────────────────────────────────────
+          print("\n🔍 Scanning for source() references in deploy set …")
+          referenced_sources = {}   # (src_name, tbl_name) → [model_files]
+          for path in all_deploy_paths:
+              sql = git_show(src_branch, path)
+              for src_name, tbl_name in extract_sources(sql):
+                  key = (src_name, tbl_name)
+                  referenced_sources.setdefault(key, []).append(path)
 
-          print(f"✅ Resolved {len(all_resolved)} unique model(s) across {len(input_models)} input(s)")
-          print("Models to deploy:", sorted(all_resolved))
+          print(f"  Found {len(referenced_sources)} unique source() references")
+
+          # Parse sources.yml files on DESTINATION branch
+          print("\n📄 Parsing sources.yml on destination branch …")
+          dst_all_files = git_tree_files(dst_branch)
+          sources_yml_files = [
+              f for f in dst_all_files
+              if f.endswith("sources.yml") or f.endswith("source.yml") or "sources" in Path(f).name.lower()
+              and f.endswith(".yml")
+          ]
+
+          defined_sources = set()   # set of (source_name, table_name)
+          for yf in sources_yml_files:
+              content = git_show(dst_branch, yf)
+              try:
+                  data = yaml.safe_load(content) or {}
+                  for src_block in data.get("sources", []):
+                      src_name = src_block.get("name", "")
+                      for tbl in src_block.get("tables", []):
+                          tbl_name = tbl.get("name", "")
+                          defined_sources.add((src_name, tbl_name))
+              except Exception as e:
+                  print(f"  ⚠️  Could not parse {yf}: {e}")
+
+          print(f"  Found {len(defined_sources)} defined sources across {len(sources_yml_files)} sources.yml files")
+
+          # ── find missing sources ──────────────────────────────────────────────
+          missing_sources = []
+          for (src_name, tbl_name), referencing_files in referenced_sources.items():
+              if (src_name, tbl_name) not in defined_sources:
+                  missing_sources.append({
+                      "source": src_name,
+                      "table": tbl_name,
+                      "referenced_in": referencing_files
+                  })
+
+          # ── write output files ────────────────────────────────────────────────
+          with open("/tmp/lineage_files_to_deploy.txt", "w") as f:
+              f.write("\n".join(all_deploy_paths))
+
+          with open("/tmp/missing_sources.json", "w") as f:
+              json.dump(missing_sources, f, indent=2)
+
+          with open("/tmp/not_found_models.txt", "w") as f:
+              f.write("\n".join(not_found))
+
+          with open("/tmp/lineage_stats.json", "w") as f:
+              json.dump({
+                  "seed_count": len(seed_models),
+                  "total_deploy": len(all_deploy_paths),
+                  "missing_source_count": len(missing_sources),
+                  "not_found_count": len(not_found),
+                  "seed_models": sorted(seed_models),
+                  "deploy_models": sorted(deploy_models),
+              }, f, indent=2)
+
+          print(f"\n✅ Resolved {len(all_deploy_paths)} files to deploy")
+          if missing_sources:
+              print(f"⚠️  {len(missing_sources)} source references NOT found in destination sources.yml")
+          else:
+              print("✅ All source() references are defined in destination branch")
           PYEOF
+        env:
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          DESTINATION_BRANCH: ${{ inputs.destination_branch }}
+          FILE_NAMES: ${{ inputs.file_names }}
+          RESOLVE_LINEAGE: ${{ inputs.resolve_lineage }}
 
-      - name: Restore destination branch context after dbt parsing
-        if: inputs.file_names != ''
-        run: |
-          git checkout "${{ inputs.destination_branch }}"
-          echo "✅ Restored destination branch context"
-
-      - name: Get changed files with status
+      # ── 7. Get changed files between branches ────────────────────────────────
+      - name: Get changed files between branches
         id: check_changes
         run: |
-          git fetch origin "${{ inputs.source_branch }}"
-
-          echo "Getting changed files between branches..."
           git diff --name-status --diff-filter=ACMR \
             "origin/${{ inputs.destination_branch }}...origin/${{ inputs.source_branch }}" \
             > /tmp/all_changed_files_with_status.txt || true
@@ -296,119 +300,64 @@ jobs:
             > /tmp/all_changed_files.txt || true
 
           CHANGE_COUNT=$(wc -l < /tmp/all_changed_files.txt | xargs)
-          echo "Found ${CHANGE_COUNT} changed files"
+          echo "Found ${CHANGE_COUNT} changed files between branches"
 
           if [ "$CHANGE_COUNT" -eq 0 ]; then
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            echo "⚠️ No changes detected between branches"
           else
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
-            echo "✅ Changes detected, proceeding with deployment"
           fi
 
-      - name: Analyze files to deploy
+      # ── 8. Intersect lineage list with actually-changed files ─────────────────
+      - name: Filter deploy list to changed files only
         id: analyze_files
         if: steps.check_changes.outputs.has_changes == 'true'
         run: |
-          # ── Resolve which file list to use ────────────────────────────────
-          # If dbt resolved dependencies, use those; otherwise fall back
-          # to the raw workflow input.
-          if [ -f /tmp/resolved_file_names.txt ] && [ -s /tmp/resolved_file_names.txt ]; then
-            FILE_NAMES_INPUT=$(cat /tmp/resolved_file_names.txt)
-            echo "📦 Using dbt-resolved dependency list: ${FILE_NAMES_INPUT}"
-          else
-            FILE_NAMES_INPUT="${{ inputs.file_names }}"
-            echo "📦 Using raw file_names input: ${FILE_NAMES_INPUT}"
-          fi
-
           EXCLUDE_FILES="${{ inputs.exclude_files }}"
-          CHANGED_FILES=$(cat /tmp/all_changed_files.txt || true)
-
           IFS=',' read -ra EXCLUDE_ARRAY <<< "$EXCLUDE_FILES"
 
-          FILES_TO_DEPLOY=""
-          NO_CHANGE_FILES=""
-          FAILED_FILES=""
-          NO_CHANGE_COUNT=0
+          DEPLOY_INPUT="/tmp/lineage_files_to_deploy.txt"
+          CHANGED="/tmp/all_changed_files.txt"
+
+          # If no specific file_names given → use all changed files (original behaviour)
+          # If file_names given    → intersect lineage list with changed files
+          FILE_NAMES_INPUT="${{ inputs.file_names }}"
 
           if [ -z "$FILE_NAMES_INPUT" ]; then
-            echo "Mode: Full deployment (all changed files)"
-            FILES_TO_DEPLOY="$CHANGED_FILES"
+            # Full deployment mode — use all changed files
+            cp "$CHANGED" /tmp/files_to_deploy_raw.txt
           else
-            echo "Mode: Selective deployment (dbt-resolved models)"
-            IFS=',' read -ra INPUT_FILES <<< "$FILE_NAMES_INPUT"
-            for input in "${INPUT_FILES[@]}"; do
-              input=$(echo "$input" | xargs)
-              [ -z "$input" ] && continue
-
-              if echo "$input" | grep -q '\.'; then
-                MATCH=$(echo "$CHANGED_FILES" | grep -Fx "$input" || true)
-              else
-                MATCH=$(echo "$CHANGED_FILES" | grep -E "(^|/)${input}\.[a-zA-Z0-9]+$" || true)
-              fi
-
-              if [ -n "$MATCH" ]; then
-                FILES_TO_DEPLOY="${FILES_TO_DEPLOY}${MATCH}"$'\n'
-              else
-                git fetch origin "${{ inputs.source_branch }}" "${{ inputs.destination_branch }}"
-
-                if echo "$input" | grep -q '\.'; then
-                  SEARCH_FILE="$input"
-                else
-                  SEARCH_FILE=$(git ls-tree -r --name-only "origin/${{ inputs.source_branch }}" | grep -E "(^|/)${input}\.[a-zA-Z0-9]+$" | head -1 || true)
-                fi
-
-                if [ -n "$SEARCH_FILE" ]; then
-                  if git ls-tree -r --name-only "origin/${{ inputs.destination_branch }}" | grep -Fxq "$SEARCH_FILE"; then
-                    if git diff --quiet "origin/${{ inputs.destination_branch }}" "origin/${{ inputs.source_branch }}" -- "$SEARCH_FILE" 2>/dev/null; then
-                      NO_CHANGE_FILES="${NO_CHANGE_FILES}- ${SEARCH_FILE} (no changes between branches)"$'\n'
-                      NO_CHANGE_COUNT=$((NO_CHANGE_COUNT + 1))
-                    else
-                      FILES_TO_DEPLOY="${FILES_TO_DEPLOY}${SEARCH_FILE}"$'\n'
-                    fi
-                  else
-                    FILES_TO_DEPLOY="${FILES_TO_DEPLOY}${SEARCH_FILE}"$'\n'
-                  fi
-                else
-                  FAILED_FILES="${FAILED_FILES}- ${input} (file not found in source branch)"$'\n'
-                fi
-              fi
-            done
+            # Selective mode — only deploy files that are BOTH in lineage list
+            # AND actually differ between branches
+            comm -12 \
+              <(sort "$DEPLOY_INPUT") \
+              <(sort "$CHANGED") \
+              > /tmp/files_to_deploy_raw.txt
           fi
 
           # Remove excluded files
-          FILTERED_FILES=""
-          echo "$FILES_TO_DEPLOY" | sort -u > /tmp/files_to_deploy_temp.txt
-
+          FILTERED=""
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             SKIP=false
             for ex in "${EXCLUDE_ARRAY[@]}"; do
               echo "$file" | grep -Fq "$ex" && SKIP=true
             done
-            if [ "$SKIP" = false ]; then
-              FILTERED_FILES="${FILTERED_FILES}${file}"$'\n'
-            fi
-          done < /tmp/files_to_deploy_temp.txt
+            [ "$SKIP" = false ] && FILTERED="${FILTERED}${file}"$'\n'
+          done < /tmp/files_to_deploy_raw.txt
 
-          echo "$FILTERED_FILES" | grep -v '^$' > /tmp/files_to_deploy.txt || true
-          echo "$NO_CHANGE_FILES"  > /tmp/no_change_files.txt
-          echo "$FAILED_FILES"     > /tmp/failed_files.txt
-          echo "$NO_CHANGE_COUNT"  > /tmp/no_change_count.txt
+          echo "$FILTERED" | grep -v '^$' > /tmp/files_to_deploy.txt || true
 
-          DEPLOY_COUNT=$(cat /tmp/files_to_deploy.txt | grep -c '^' || echo "0")
-
+          DEPLOY_COUNT=$(grep -c '^' /tmp/files_to_deploy.txt 2>/dev/null || echo 0)
           echo "Files to deploy: ${DEPLOY_COUNT}"
-          echo "No change files: ${NO_CHANGE_COUNT}"
 
           if [ "$DEPLOY_COUNT" -eq 0 ]; then
             echo "has_files_to_deploy=false" >> "$GITHUB_OUTPUT"
-            echo "⚠️ No files to deploy after filtering"
           else
             echo "has_files_to_deploy=true" >> "$GITHUB_OUTPUT"
-            echo "✅ ${DEPLOY_COUNT} files ready to deploy"
           fi
 
+      # ── 9. Create merger branch ───────────────────────────────────────────────
       - name: Create merger branch
         id: create_branch
         if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
@@ -419,25 +368,19 @@ jobs:
           DST=$(echo "${{ inputs.destination_branch }}" | tr '[:upper:]' '[:lower:]' | sed 's/[\/ ]/_/g')
           MERGER_BRANCH="${SRC}_to_${DST}_merger_${TIMESTAMP}"
           echo "merger_branch=${MERGER_BRANCH}" >> "$GITHUB_OUTPUT"
-          echo "Creating merger branch: ${MERGER_BRANCH}"
 
           git fetch origin "${{ inputs.destination_branch }}"
           git checkout -b "${MERGER_BRANCH}" "origin/${{ inputs.destination_branch }}"
           git push -u origin "${MERGER_BRANCH}"
-          echo "✅ Merger branch created and pushed"
+          echo "✅ Merger branch: ${MERGER_BRANCH}"
 
+      # ── 10. Deploy files ──────────────────────────────────────────────────────
       - name: Deploy files to merger branch
         id: cherry_pick
         if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
         run: |
           set -e
           git checkout "${{ steps.create_branch.outputs.merger_branch }}"
-
-          DEPLOYED_NEW_FILES=""
-          DEPLOYED_MODIFIED_FILES=""
-          NEW_COUNT=0
-          MODIFIED_COUNT=0
-
           git fetch origin "${{ inputs.source_branch }}"
 
           declare -A FILE_STATUS_MAP
@@ -445,14 +388,16 @@ jobs:
             FILE_STATUS_MAP["$file"]="$status"
           done < /tmp/all_changed_files_with_status.txt
 
-          echo "Processing files for deployment..."
+          DEPLOYED_NEW_FILES=""
+          DEPLOYED_MODIFIED_FILES=""
+          NEW_COUNT=0
+          MODIFIED_COUNT=0
+
           while IFS= read -r file; do
             [ -z "$file" ] && continue
-
             echo "  Deploying: $file"
             git checkout "origin/${{ inputs.source_branch }}" -- "$file"
             git add "$file"
-
             STATUS="${FILE_STATUS_MAP[$file]}"
             if [ "$STATUS" = "A" ]; then
               DEPLOYED_NEW_FILES="${DEPLOYED_NEW_FILES}- ${file}"$'\n'
@@ -463,63 +408,54 @@ jobs:
             fi
           done < /tmp/files_to_deploy.txt
 
-          echo "$DEPLOYED_NEW_FILES"      > /tmp/deployed_new_files.txt
-          echo "$DEPLOYED_MODIFIED_FILES" > /tmp/deployed_modified_files.txt
-          echo "$NEW_COUNT"               > /tmp/new_count.txt
-          echo "$MODIFIED_COUNT"          > /tmp/modified_count.txt
+          echo "$DEPLOYED_NEW_FILES"     > /tmp/deployed_new_files.txt
+          echo "$DEPLOYED_MODIFIED_FILES"> /tmp/deployed_modified_files.txt
+          echo "$NEW_COUNT"              > /tmp/new_count.txt
+          echo "$MODIFIED_COUNT"         > /tmp/modified_count.txt
+          echo "$((NEW_COUNT + MODIFIED_COUNT))" > /tmp/deployed_count.txt
 
-          TOTAL_DEPLOYED=$((NEW_COUNT + MODIFIED_COUNT))
-          echo "$TOTAL_DEPLOYED"          > /tmp/deployed_count.txt
+          echo "  New: ${NEW_COUNT}  Modified: ${MODIFIED_COUNT}"
 
-          echo "Deployment summary:"
-          echo "  New files: ${NEW_COUNT}"
-          echo "  Modified files: ${MODIFIED_COUNT}"
-          echo "  Total deployed: ${TOTAL_DEPLOYED}"
-
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "✅ Changes staged successfully"
-          else
-            echo "⚠️ No changes staged (unexpected)"
-          fi
-
+      # ── 11. Commit and push ───────────────────────────────────────────────────
       - name: Commit changes
         if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
         run: |
           git commit -m "Automated deployment from ${{ inputs.source_branch }} to ${{ inputs.destination_branch }}"
           git push origin "${{ steps.create_branch.outputs.merger_branch }}"
-          echo "✅ Changes committed and pushed"
+          echo "✅ Pushed merger branch"
 
+      # ── 12. Create Pull Request with lineage summary + source warnings ─────────
       - name: Create Pull Request
         if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
-        uses: actions/github-script@v7
         id: create_pr
+        uses: actions/github-script@v7
         env:
-          GITHUB_TOKEN:        ${{ inputs.github_token }}
-          SOURCE_BRANCH:       ${{ inputs.source_branch }}
-          DESTINATION_BRANCH:  ${{ inputs.destination_branch }}
-          MERGER_BRANCH:       ${{ steps.create_branch.outputs.merger_branch }}
-          DEPLOYER:            ${{ github.actor }}
-          FILE_NAMES:          ${{ inputs.file_names }}
+          GITHUB_TOKEN: ${{ inputs.github_token }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          DESTINATION_BRANCH: ${{ inputs.destination_branch }}
+          MERGER_BRANCH: ${{ steps.create_branch.outputs.merger_branch }}
+          DEPLOYER: ${{ github.actor }}
+          FILE_NAMES: ${{ inputs.file_names }}
         with:
           github-token: ${{ inputs.github_token }}
           script: |
-            const fs = require('fs');
+            const fs   = require('fs');
+            const read = (p, def='') => fs.existsSync(p) ? fs.readFileSync(p,'utf8') : def;
 
-            // ── Read all temp files ──────────────────────────────────────────
-            const deployedNewFiles      = fs.existsSync('/tmp/deployed_new_files.txt')      ? fs.readFileSync('/tmp/deployed_new_files.txt','utf8')      : '';
-            const deployedModifiedFiles = fs.existsSync('/tmp/deployed_modified_files.txt') ? fs.readFileSync('/tmp/deployed_modified_files.txt','utf8') : '';
-            const noChangeFiles         = fs.existsSync('/tmp/no_change_files.txt')         ? fs.readFileSync('/tmp/no_change_files.txt','utf8')         : '';
-            const failedFiles           = fs.existsSync('/tmp/failed_files.txt')            ? fs.readFileSync('/tmp/failed_files.txt','utf8')            : '';
-            const allChanges            = fs.existsSync('/tmp/all_changed_files.txt')       ? fs.readFileSync('/tmp/all_changed_files.txt','utf8')       : '';
-            const dbtSummary            = fs.existsSync('/tmp/dbt_deps_summary.txt')        ? fs.readFileSync('/tmp/dbt_deps_summary.txt','utf8')        : '';
-            const resolvedFiles         = fs.existsSync('/tmp/resolved_file_names.txt')     ? fs.readFileSync('/tmp/resolved_file_names.txt','utf8').trim(): '';
+            const deployedNewFiles      = read('/tmp/deployed_new_files.txt');
+            const deployedModifiedFiles = read('/tmp/deployed_modified_files.txt');
+            const newCount              = read('/tmp/new_count.txt','0').trim();
+            const modifiedCount         = read('/tmp/modified_count.txt','0').trim();
+            const deployedCount         = read('/tmp/deployed_count.txt','0').trim();
+            const notFoundModels        = read('/tmp/not_found_models.txt');
+            const lineageStatsRaw       = read('/tmp/lineage_stats.json','{}');
+            const missingSrcRaw         = read('/tmp/missing_sources.json','[]');
+            const filesToDeployList     = read('/tmp/files_to_deploy.txt');
 
-            const newCount      = fs.existsSync('/tmp/new_count.txt')       ? fs.readFileSync('/tmp/new_count.txt','utf8').trim()       : '0';
-            const modifiedCount = fs.existsSync('/tmp/modified_count.txt')  ? fs.readFileSync('/tmp/modified_count.txt','utf8').trim()  : '0';
-            const noChangeCount = fs.existsSync('/tmp/no_change_count.txt') ? fs.readFileSync('/tmp/no_change_count.txt','utf8').trim() : '0';
-            const deployedCount = fs.existsSync('/tmp/deployed_count.txt')  ? fs.readFileSync('/tmp/deployed_count.txt','utf8').trim()  : '0';
-
-            const filesList = allChanges.split('\n').filter(f => f.trim());
+            let lineageStats = {};
+            let missingSources = [];
+            try { lineageStats  = JSON.parse(lineageStatsRaw); } catch(e) {}
+            try { missingSources = JSON.parse(missingSrcRaw);  } catch(e) {}
 
             const src        = process.env.SOURCE_BRANCH      || '';
             const dst        = process.env.DESTINATION_BRANCH || '';
@@ -527,207 +463,141 @@ jobs:
             const actor      = process.env.DEPLOYER           || '';
             const fileNames  = process.env.FILE_NAMES         || '';
 
-            // ── PR Title with date ───────────────────────────────────────────
-            const now     = new Date();
-            const dd      = String(now.getDate()).padStart(2, '0');
-            const mm      = String(now.getMonth() + 1).padStart(2, '0');
-            const yyyy    = now.getFullYear();
-            const dateStr = `${dd}-${mm}-${yyyy}`;
-            const prTitle = `Deployment: ${src} → ${dst} | Summary || ${dateStr}`;
+            let body = '## 🚀 Deployment Request\n\n';
+            body += `**Source Branch:** \`${src}\`\n`;
+            body += `**Destination Branch:** \`${dst}\`\n`;
+            body += `**Triggered by:** @${actor}\n\n`;
 
-            // ── PR Body ──────────────────────────────────────────────────────
-            let bodyText = '## 🚀 Deployment Request\n\n';
-            bodyText += `**Source Branch:** \`${src}\`\n`;
-            bodyText += `**Destination Branch:** \`${dst}\`\n`;
-            bodyText += `**Triggered by:** @${actor}\n\n`;
-
-            // ── dbt dependency section ───────────────────────────────────────
-            if (fileNames && dbtSummary.trim()) {
-              bodyText += '### 🔍 dbt Dependency Resolution\n\n';
-              bodyText += `**Models requested:** \`${fileNames}\`\n\n`;
-              if (resolvedFiles) {
-                const resolvedList = resolvedFiles.split(',').filter(f => f.trim());
-                bodyText += `**Total resolved (model + all upstream deps):** ${resolvedList.length}\n`;
-                bodyText += '<details><summary>Click to expand resolved models</summary>\n\n';
-                resolvedList.forEach(m => { bodyText += `- \`${m}\`\n`; });
-                bodyText += '\n</details>\n\n';
+            // ── Lineage summary ──────────────────────────────────────────────
+            if (fileNames) {
+              body += '### 🌿 dbt Lineage Resolution\n\n';
+              body += `**Mode:** Selective deployment with lineage expansion\n`;
+              body += `**Seed models supplied:** ${lineageStats.seed_count ?? 0}\n`;
+              body += `**Total models after lineage expansion:** ${lineageStats.deploy_models?.length ?? 0}\n`;
+              if (lineageStats.seed_models?.length) {
+                body += `\n<details><summary>Seed models</summary>\n\n`;
+                lineageStats.seed_models.forEach(m => body += `- \`${m}\`\n`);
+                body += `\n</details>\n\n`;
               }
-              bodyText += '<details><summary>View full dependency tree breakdown</summary>\n\n';
-              bodyText += '```\n' + dbtSummary + '\n```\n';
-              bodyText += '\n</details>\n\n';
-            }
-
-            // ── Deployment summary ───────────────────────────────────────────
-            bodyText += '### 📋 Deployment Summary\n\n';
-
-            if (!fileNames) {
-              bodyText += `**Mode:** Full deployment (all changes)\n`;
-              bodyText += `**Total changes in source:** ${filesList.length} files\n`;
+              if (lineageStats.deploy_models?.length) {
+                body += `<details><summary>All resolved models (${lineageStats.deploy_models.length})</summary>\n\n`;
+                lineageStats.deploy_models.forEach(m => body += `- \`${m}\`\n`);
+                body += `\n</details>\n\n`;
+              }
             } else {
-              bodyText += `**Mode:** Selective deployment (dbt-resolved models + upstream deps)\n`;
+              body += '**Mode:** Full deployment (all changed files)\n\n';
             }
 
-            bodyText += `**✅ Successfully deployed:** ${deployedCount} files (${newCount} new, ${modifiedCount} modified)\n`;
+            // ── Deployment statistics ────────────────────────────────────────
+            body += '### 📋 Deployment Summary\n\n';
+            body += `**✅ Successfully deployed:** ${deployedCount} files (${newCount} new, ${modifiedCount} modified)\n`;
 
-            if (parseInt(noChangeCount) > 0) {
-              bodyText += `**ℹ️ No changes:** ${noChangeCount} files\n`;
+            if (notFoundModels.trim()) {
+              const nfList = notFoundModels.trim().split('\n').filter(Boolean);
+              body += `**❓ Models not found in source branch:** ${nfList.length}\n`;
             }
 
-            if (failedFiles.trim()) {
-              const failedCount = failedFiles.split('\n').filter(f => f.trim()).length;
-              bodyText += `**❌ Failed:** ${failedCount} files\n`;
-            }
-
-            bodyText += '\n';
+            body += '\n';
 
             if (deployedNewFiles.trim()) {
-              bodyText += '### ✨ New Files Deployed\n';
-              bodyText += '```\n' + deployedNewFiles + '```\n\n';
+              body += '### ✨ New Files Deployed\n```\n' + deployedNewFiles + '```\n\n';
             }
-
             if (deployedModifiedFiles.trim()) {
-              bodyText += '### 📝 Modified Files Deployed\n';
-              bodyText += '```\n' + deployedModifiedFiles + '```\n\n';
+              body += '### 📝 Modified Files Deployed\n```\n' + deployedModifiedFiles + '```\n\n';
             }
 
-            if (noChangeFiles.trim()) {
-              bodyText += '### ℹ️ Files with No Changes\n';
-              bodyText += '```\n' + noChangeFiles + '```\n\n';
+            // ── ⚠️ SOURCE WARNING BLOCK ──────────────────────────────────────
+            if (missingSources.length > 0) {
+              body += '---\n';
+              body += '## ⚠️ SOURCE VALIDATION WARNINGS\n\n';
+              body += `> **${missingSources.length} source reference(s) found in the deployed files are NOT defined in the destination branch \`sources.yml\`.**\n`;
+              body += '> This may cause \`dbt run\` failures after merge. Please verify before merging.\n\n';
+              body += '| Source Name | Table Name | Referenced In |\n';
+              body += '|-------------|------------|---------------|\n';
+              missingSources.forEach(ms => {
+                const files = ms.referenced_in.join('<br>');
+                body += `| \`${ms.source}\` | \`${ms.table}\` | ${files} |\n`;
+              });
+              body += '\n**Action required:** Add the missing source definitions to `sources.yml` on `' + dst + '` before running dbt.\n\n';
+              body += '---\n\n';
+            } else if (fileNames) {
+              body += '### ✅ Source Validation Passed\n';
+              body += 'All `source()` references in the deployed files are defined in the destination branch `sources.yml`.\n\n';
             }
 
-            if (failedFiles.trim()) {
-              bodyText += '### ⚠️ Failed/Not Found Files\n';
-              bodyText += '```\n' + failedFiles + '```\n\n';
-            }
+            // ── Excluded files ───────────────────────────────────────────────
+            body += '### 🔒 Excluded Files\n';
+            body += '- source.yml\n- relx_fivetran_connector_mapping.csv\n\n';
 
-            bodyText += '### 🔒 Excluded Files (Auto-restored from destination if present)\n';
-            bodyText += '- source.yml\n- relx_fivetran_connector_mapping.csv\n\n';
-
-            bodyText += '### 📝 Next Steps\n';
-            bodyText += '1. Review the changes in this PR\n';
-            bodyText += '2. Approve the PR if everything looks correct\n';
-            bodyText += `3. Merge to deploy to \`${dst}\`\n`;
-            bodyText += '4. **Manual Step**: Run your dbt jobs after merge\n\n';
-
-            if (!fileNames) {
-              bodyText += `### 📊 All Changed Files in Source\n<details><summary>Click to expand (${filesList.length} files)</summary>\n\n`;
-              filesList.forEach(file => { bodyText += `- ${file}\n`; });
-              bodyText += `\n</details>`;
-            }
+            // ── Next Steps ───────────────────────────────────────────────────
+            body += '### 📝 Next Steps\n';
+            body += '1. Review the changes in this PR\n';
+            body += '2. Resolve any ⚠️ source warnings above\n';
+            body += '3. Approve and merge to deploy to `' + dst + '`\n';
+            body += '4. **Manual Step:** Run your dbt jobs after merge\n';
 
             const pr = await github.rest.pulls.create({
               owner: context.repo.owner,
               repo:  context.repo.repo,
-              title: prTitle,
+              title: `Deployment: ${src} → ${dst}`,
               head:  headBranch,
               base:  dst,
-              body:  bodyText
+              body:  body,
             });
 
-            core.info(`✅ Pull Request #${pr.data.number} created successfully`);
-            core.info(`🔗 PR URL: ${pr.data.html_url}`);
-
+            core.info(`✅ PR #${pr.data.number} created: ${pr.data.html_url}`);
             return pr.data.number;
 
+      # ── 13. Labels ────────────────────────────────────────────────────────────
       - name: Add labels to PR
         if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
         uses: actions/github-script@v7
         env:
           GITHUB_TOKEN: ${{ inputs.github_token }}
-          PR_NUMBER:    ${{ steps.create_pr.outputs.result }}
+          PR_NUMBER: ${{ steps.create_pr.outputs.result }}
         with:
           github-token: ${{ inputs.github_token }}
           script: |
             const prNumber = Number(process.env.PR_NUMBER || 0);
-            if (!prNumber) {
-              console.log('No PR number available; skipping label addition.');
-              return;
-            }
+            if (!prNumber) return;
             try {
               await github.rest.issues.addLabels({
-                owner:        context.repo.owner,
-                repo:         context.repo.repo,
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
                 issue_number: prNumber,
-                labels:       ['automated-deployment', 'deployment']
+                labels: ['automated-deployment', 'deployment', 'dbt-lineage'],
               });
-              console.log('Labels added to PR:', prNumber);
-            } catch (error) {
-              console.log('Could not add labels (they may not exist):', error.message);
+            } catch (e) {
+              console.log('Could not add labels:', e.message);
             }
 
+      # ── 14. Step Summary ──────────────────────────────────────────────────────
       - name: Summary - Success
         if: steps.check_changes.outputs.has_changes == 'true' && steps.analyze_files.outputs.has_files_to_deploy == 'true'
         run: |
           NEW_COUNT=$(cat /tmp/new_count.txt)
           MODIFIED_COUNT=$(cat /tmp/modified_count.txt)
-          NO_CHANGE_COUNT=$(cat /tmp/no_change_count.txt)
           DEPLOYED_COUNT=$(cat /tmp/deployed_count.txt)
+          MISSING_SRC=$(python3 -c "import json; d=json.load(open('/tmp/missing_sources.json')); print(len(d))" 2>/dev/null || echo 0)
 
-          echo "## ✅ Deployment PR Created Successfully" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## ✅ Deployment PR Created" >> "$GITHUB_STEP_SUMMARY"
           echo "**PR Number:** ${{ steps.create_pr.outputs.result }}" >> "$GITHUB_STEP_SUMMARY"
           echo "**Merger Branch:** \`${{ steps.create_branch.outputs.merger_branch }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          if [ -f /tmp/dbt_deps_summary.txt ] && [ -s /tmp/dbt_deps_summary.txt ]; then
-            echo "### 🔍 dbt Dependency Resolution" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            cat /tmp/dbt_deps_summary.txt >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Deployment Statistics" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ✅ Deployed: ${DEPLOYED_COUNT} files (${NEW_COUNT} new, ${MODIFIED_COUNT} modified)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$MISSING_SRC" -gt 0 ]; then
+            echo "- ⚠️ Missing source definitions: ${MISSING_SRC} — **check PR warnings**" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- ✅ All sources validated against destination sources.yml" >> "$GITHUB_STEP_SUMMARY"
           fi
-
-          echo "### Deployment Statistics:" >> "$GITHUB_STEP_SUMMARY"
-          echo "- ✅ **Successfully Deployed:** ${DEPLOYED_COUNT} files" >> "$GITHUB_STEP_SUMMARY"
-          echo "  - ✨ New files: ${NEW_COUNT}" >> "$GITHUB_STEP_SUMMARY"
-          echo "  - 📝 Modified files: ${MODIFIED_COUNT}" >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "$NO_CHANGE_COUNT" != "0" ]; then
-            echo "- ℹ️ **No Changes:** ${NO_CHANGE_COUNT} files" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "### Next Steps:" >> "$GITHUB_STEP_SUMMARY"
-          echo "1. Review the PR at the link above" >> "$GITHUB_STEP_SUMMARY"
-          echo "2. Request review from your team" >> "$GITHUB_STEP_SUMMARY"
-          echo "3. Merge after approval" >> "$GITHUB_STEP_SUMMARY"
-          echo "4. **Manually run your dbt jobs after merge**" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Summary - No Changes
         if: steps.check_changes.outputs.has_changes == 'false' || steps.analyze_files.outputs.has_files_to_deploy == 'false'
         run: |
           echo "## ℹ️ No Changes to Deploy" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-
           if [ "${{ steps.check_changes.outputs.has_changes }}" == "false" ]; then
-            echo "**Reason:** No differences found between \`${{ inputs.source_branch }}\` and \`${{ inputs.destination_branch }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "No differences found between branches." >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "**Reason:** All files were either excluded or had no changes" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "No merger branch was created." >> "$GITHUB_STEP_SUMMARY"
-
-          if [ -f /tmp/dbt_deps_summary.txt ] && [ -s /tmp/dbt_deps_summary.txt ]; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "### 🔍 dbt Dependency Resolution (no changed files found)" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            cat /tmp/dbt_deps_summary.txt >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-          if [ -f /tmp/no_change_files.txt ] && [ -s /tmp/no_change_files.txt ]; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "### Files with No Changes:" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            cat /tmp/no_change_files.txt >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-          if [ -f /tmp/failed_files.txt ] && [ -s /tmp/failed_files.txt ]; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "### Files Not Found:" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            cat /tmp/failed_files.txt >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "All resolved files were excluded or had no changes." >> "$GITHUB_STEP_SUMMARY"
           fi
